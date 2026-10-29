@@ -501,6 +501,8 @@ window.__ModuleLoader__.load({
             h(Row, { label: '运行模式' },
               h('select', {
                 className: 'pmb-input',
+                // 截图里「assist（照常注…」被截断：下拉框要给够宽度，四个模式说明才看得全
+                style: { minWidth: '22rem', maxWidth: '100%' },
                 value: cue.mode || 'assist',
                 disabled: busy || cue.enabled !== true,
                 onChange: (ev) => saveCue({ mode: ev.target.value }),
