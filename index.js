@@ -6451,6 +6451,8 @@ function apply(ctx) {
                     verdict: "silent",
                     summary: evSummary || judged.hint || "",
                     topic: isEv ? String(judged.pick.eventKey || "") : "",
+                    confidence: judged.confidence,
+                    sources: { important: picked.fromImportant || 0, event: picked.fromEvent || 0, normal: picked.fromNormal || 0 },
                   });
                   diag(`回忆事件：${evRow.id}（待他表态）`);
                   cp.savePending(sessionId, {
@@ -6926,7 +6928,13 @@ function apply(ctx) {
           if (action === "stats") {
             const st = cp.stats();
             const enabled = loadConfig().cueprompt?.enabled ? "开" : "关";
-            return `取词器/提词器：开关 ${enabled}｜重要 ${st.important} 条（生效 ${st.active}）｜回忆事件 ${st.events} 条（${st.eventMonths || 0} 个月）｜记错 ${st.misrecall} 条`;
+            const v = st.verdicts || { confirmed: 0, denied: 0, objected: 0, silent: 0 };
+            const pctOf = (a) => (st.proposed ? `${((a / st.proposed) * 100).toFixed(1)}%` : "—");
+            return [
+              `取词器/提词器：开关 ${enabled}｜重要 ${st.important} 条（生效 ${st.active}）｜回忆事件 ${st.events} 条（${st.eventMonths || 0} 个月）｜记错 ${st.misrecall} 条`,
+              `数据链（最近 ${st.proposed} 次提出）：成功 ${v.confirmed} / 反对 ${v.objected} / 否认 ${v.denied} / 沉默 ${v.silent}（沉默率 ${pctOf(v.silent)}）`,
+              `来源构成：事件 ${st.sourceMix?.event || 0} / 重要 ${st.sourceMix?.important || 0} / 常规 ${st.sourceMix?.normal || 0}｜平均置信度 ${st.avgConfidence === null || st.avgConfidence === undefined ? "—" : Number(st.avgConfidence).toFixed(2)}`,
+            ].join(String.fromCharCode(10));
           }
           if (action === "events") {
             const rows = cp.readEvents(limit).reverse();

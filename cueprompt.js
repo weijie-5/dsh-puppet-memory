@@ -385,7 +385,7 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
   }
 
   /** 记一次回忆事件（成败都记）：明细分月落盘，同时维护一行月索引 */
-  function recordEvent({ session = "", scene = "private", candidates = [], pick = null, verdict = "silent", replyFingerprint = "", summary = "", topic = "" } = {}) {
+  function recordEvent({ session = "", scene = "private", candidates = [], pick = null, verdict = "silent", replyFingerprint = "", summary = "", topic = "", confidence = null, sources = null } = {}) {
     const ts = now();
     // 丹阳 2026-10-29：事件里要带一句**总结**（这条回忆到底讲的什么事），
     // 同话题的多次事件靠 topic 归并；总结不是分数，只给人看，也不参与取词排序。
@@ -406,6 +406,10 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       candidates: candidates.map((c) => c.hash).slice(0, 8),
       myTextFingerprint: replyFingerprint,
       verdict,
+      // 数据链（2026-10-29）：把「判的时候有多准、候选从哪来」也落下来，
+      // 否则只有成败、没有分母，调参全靠体感。
+      confidence: confidence === null || confidence === undefined ? null : Number(confidence),
+      sources: sources && typeof sources === "object" ? sources : null,
     };
     const month = monthKeyOf(ts);
     const file = path.join(paths.eventsDir, `${month}.jsonl`);
@@ -594,12 +598,39 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     }
     events += readJsonl(paths.legacyEvents).length;
     const months = readJsonl(paths.eventsIndex).length;
+    // 数据链聚合：近 500 条事件里有几条是「提出过的回忆」、各判定占多少、平均置信度、候选来源构成
+    let rows = [];
+    try {
+      rows = readEvents(500);
+    } catch {
+      rows = [];
+    }
+    const by = { confirmed: 0, denied: 0, objected: 0, silent: 0 };
+    const mix = { important: 0, event: 0, normal: 0 };
+    let confSum = 0;
+    let confN = 0;
+    for (const r of rows) {
+      const k = ["confirmed", "denied", "objected"].includes(r.verdict) ? r.verdict : "silent";
+      by[k] += 1;
+      if (r.confidence !== null && r.confidence !== undefined && Number.isFinite(Number(r.confidence))) {
+        confSum += Number(r.confidence);
+        confN += 1;
+      }
+      const src = r.sources || {};
+      for (const key of Object.keys(mix)) mix[key] += Number(src[key] || 0);
+    }
+    const proposed = rows.length;
     return {
       important: imps.length,
       active: imps.filter((r) => String(r.state || "active") === "active").length,
       events,
       eventMonths: months,
       misrecall: readJsonl(paths.misrecall).length,
+      proposed,
+      verdicts: by,
+      silentRate: proposed ? by.silent / proposed : 0,
+      avgConfidence: confN ? confSum / confN : null,
+      sourceMix: mix,
     };
   }
 

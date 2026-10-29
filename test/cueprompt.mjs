@@ -146,6 +146,7 @@ try {
   ok("月索引记了成败计数", Number(mindex[0].confirmed) === 1, JSON.stringify(mindex[0]));
   const st = cp.stats();
   ok("统计能报数（含月份数）", st.important >= 1 && st.events === 1 && st.misrecall >= 1 && st.eventMonths === 1, JSON.stringify(st));
+  ok("统计带数据链（提出数/沉默率/来源）", st.proposed >= 1 && st.verdicts && Number.isFinite(st.silentRate) && Boolean(st.sourceMix), JSON.stringify({ proposed: st.proposed, silentRate: st.silentRate, mix: st.sourceMix }));
   // 旧单文件仍能读（兼容）
   fs.appendFileSync(path.join(TMP, "deep", "recall-events.jsonl"), J({ ts: "2026-09-30T00:00:00.000Z", verdict: "denied", session: "old" }) + String.fromCharCode(10), "utf8");
   const withLegacy = cp.readEvents(20);
@@ -188,6 +189,21 @@ try {
   ok("先看事件总结，再看重要库（丹阳定的顺序）", priPick.candidates[0]?.kind === "event", JSON.stringify(priPick.candidates.map((c) => c.kind)));
   const evCand = evPick.candidates.find((c) => c.kind === "event");
   ok("事件候选带事件键（判定时能并回同一组）", String(evCand?.hash || "").startsWith("ev:") && Boolean(evCand?.eventKey), JSON.stringify(evCand));
+
+  // ---- 7c. 数据链：事件记下置信度和候选来源，stats 能算沉默率/平均置信度
+  const evChain = cp.recordEvent({
+    session: "s7",
+    pick: { hash: "h-chain", topic: "数据链测试" },
+    candidates: [],
+    verdict: "silent",
+    summary: "这条用来验数据链",
+    confidence: 0.82,
+    sources: { important: 1, event: 2, normal: 3 },
+  });
+  ok("事件记下置信度", Number(evChain.confidence) === 0.82, JSON.stringify(evChain.confidence));
+  ok("事件记下来源构成", evChain.sources && evChain.sources.event === 2, JSON.stringify(evChain.sources));
+  const stAfterChain = cp.stats();
+  ok("统计能算平均置信度", Number(stAfterChain.avgConfidence) === 0.82, JSON.stringify(stAfterChain.avgConfidence));
 
   // ---- 8b. 待判回忆落盘：重启（换实例）后还在
   cp.savePending("sess-a", { hash: "h-x", importantId: "", candidates: [{ hash: "h-x" }] });
