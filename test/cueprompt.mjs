@@ -141,6 +141,11 @@ try {
   ok("归并组带统计与最后一句总结", grp && grp.confirmed === 1 && grp.objected === 1 && grp.summary.includes("确认"), JSON.stringify(grp));
   ok("归并组按最近时间排在前面", groups8[0]?.key === "反数值设计", JSON.stringify(groups8.map((g) => g.key)));
 
+  // 二步法溯源（丹阳 2026-10-29）：第一步我自己写总结=ai，他确认过=both
+  const aiEv = cp.readEvents(20).find((e) => e.topic === "反数值设计" && e.verdict === "objected");
+  const bothEv = cp.readEvents(20).find((e) => e.topic === "反数值设计" && e.verdict === "confirmed");
+  ok("事件总结标了是谁定的（我的一步/双方）", aiEv?.summaryBy === "ai" && bothEv?.summaryBy === "both", JSON.stringify({ ai: aiEv?.summaryBy, both: bothEv?.summaryBy }));
+
   // ---- 8a2. 事件总结本身也能被取词（丹阳 2026-10-29：「检索事件的几率不高，得想办法加」）
   const evPick = cp.pickCandidates({ userText: "数值设计那件事", searchFn: () => [], limit: 6 });
   ok("事件总结能当取词候选", evPick.candidates.some((c) => c.kind === "event"), JSON.stringify(evPick.candidates.map((c) => c.kind)));

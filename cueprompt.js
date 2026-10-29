@@ -355,6 +355,9 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       importantId: pick?.importantId || "",
       topic: String(topic || pick?.topic || "").trim(),
       summary: String(summary || pick?.hint || "").trim().slice(0, 200),
+      // 丹阳 2026-10-29：二步法——第一步我自己写总结，第二步双方确认。
+      // by=ai（我的一步，未合意）/ both（他确认过，双方）；只做溯源标记，不参与取词打分。
+      summaryBy: verdict === "confirmed" ? "both" : "ai",
       candidates: candidates.map((c) => c.hash).slice(0, 8),
       myTextFingerprint: replyFingerprint,
       verdict,
@@ -418,7 +421,10 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       const ts = String(r.ts || "");
       if (!hit.lastAt || ts > hit.lastAt) {
         hit.lastAt = ts;
-        if (r.summary) hit.summary = r.summary;
+        if (r.summary) {
+          hit.summary = r.summary;
+          hit.summaryBy = r.summaryBy || "ai";
+        }
       }
       if (r.summary && hit.samples.length < 3 && !hit.samples.includes(r.summary)) hit.samples.push(r.summary);
       if (!hit.hash && r.hash) hit.hash = r.hash;

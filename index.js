@@ -6877,7 +6877,8 @@ function apply(ctx) {
               if (g.denied) stat.push(`失败 ${g.denied}`);
               if (g.objected) stat.push(`反对 ${g.objected}`);
               if (g.silent) stat.push(`沉默 ${g.silent}`);
-              const summary = g.summary ? `\n    总结：${g.summary}` : "\n    总结：（还没写——下次命中时按当时的提词补一句）";
+              const who = g.summaryBy === "both" ? "双方" : "我的一步";
+              const summary = g.summary ? `\n    总结（${who}）：${g.summary}` : "\n    总结：（还没写——下次命中时按当时的提词补一句）";
               return `· ${g.topic || (g.hash ? `#${String(g.hash).slice(0, 8)}` : "(无主题)")}｜${g.count} 次（${stat.join(" / ")}）｜最近 ${String(g.lastAt || "").slice(5, 16)}${summary}`;
             });
             return [
