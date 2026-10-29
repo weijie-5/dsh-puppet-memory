@@ -2841,6 +2841,22 @@ function recentUserTexts(messages = [], n = 2, maxScan = 40) {
   return out;
 }
 
+/** 每会话记住「上次真正看到他的话」和「上次给哪句话抛过回忆」——宿主有些 pre-step 调用里 messages 是空的 */
+const CUE_SEEN_PATH = path.join(MEM_DIR, "state", "cue-last-seen.json");
+function cueSeenGet(sessionId) {
+  const all = readJson(CUE_SEEN_PATH, {});
+  const row = all && typeof all === "object" ? all[sessionId] : null;
+  return row && typeof row === "object" ? row : null;
+}
+function cueSeenSet(sessionId, patch) {
+  const all = readJson(CUE_SEEN_PATH, {}) || {};
+  all[sessionId] = { ...(all[sessionId] || {}), ...patch, at: Date.now() };
+  const keys = Object.keys(all).slice(-50);
+  const kept = {};
+  for (const k of keys) kept[k] = all[k];
+  writeJson(CUE_SEEN_PATH, kept);
+}
+
 /** 把 memory_search 的文本结果转成提词器的候选（只要 hash/摘要/来源） */
 function cueHitsOf(query, n = 7) {
   try {
@@ -6365,7 +6381,17 @@ function apply(ctx) {
             const NL = String.fromCharCode(10);
             // 剥掉注入块后可能只剩空串（宿主把 <puppet_*> 也记成 user/message，还不一定带 source），
             // 所以多取几条、只留剥完仍有内容的：第 0 条是这一段，第 1 条是上一段。
-            const texts = recentUserTexts(decision.messages || [], 2);
+            let texts = recentUserTexts(decision.messages || [], 2);
+            if (!texts.length) {
+              // 宿主有时用**空 messages** 调 pre-step（注入块就是这样被塞进去的），
+              // 这时回落到本会话上次真正看到的话（5 分钟内），否则整轮都不会取词。
+              const seen = cueSeenGet(sessionId);
+              if (seen && seen.text && Date.now() - Number(seen.at || 0) < 5 * 60 * 1000) {
+                texts = [String(seen.text)];
+              }
+            } else {
+              cueSeenSet(sessionId, { text: texts[0], prev: texts[1] || "" });
+            }
             const userText = texts[0] || "";
             const prevText = texts[1] || "";
             if (!texts.length) {
@@ -6421,7 +6447,11 @@ function apply(ctx) {
               }
             }
             const gate = worthCueing(userText);
-            if (!cueText && !actedThisTurn && gate.ok) {
+            const textKey = createHash("sha1").update(userText).digest("hex").slice(0, 12);
+            const seenNow = cueSeenGet(sessionId);
+            const alreadyCued = seenNow && seenNow.cueKey === textKey;
+            if (!gate.ok && userText) diag(`取词跳过：${gate.reason}（${clip(userText, 16)}）`);
+            if (!cueText && !actedThisTurn && gate.ok && !alreadyCued) {
               const picked = cp.pickCandidates({
                 userText,
                 searchFn: (q, n) => cueHitsOf(q, n),
@@ -6477,6 +6507,7 @@ function apply(ctx) {
                   });
                   const rows = ["（提示：这件事你和他之前聊过。若自然就用平常语气带出来，别罗列资料、别贴编号）", judged.hint];
                   if (judged.question) rows.push(`（拿不准可以先问一句：${judged.question}）`);
+                  cueSeenSet(sessionId, { cueKey: textKey });
                   cueText = ["<puppet_cue>", rows.join(NL), "</puppet_cue>"].join(NL);
                 }
               }

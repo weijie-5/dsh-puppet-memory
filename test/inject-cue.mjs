@@ -179,6 +179,20 @@ try {
   const t6 = (decision6?.messages || []).map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || ""))).join(String.fromCharCode(10));
   ok("六层注入块压着也能找到他那句话", t6.includes("<puppet_cue>"), t6.slice(0, 100));
 
+  // ---- A-100：宿主有时用**空 messages** 调 pre-step → 回落到上次看到的话，且同一句不重复抛
+  const agent7 = { session: { header: { id: "cue-s7", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
+  const run7 = async (msgs) => {
+    const decision = await preStep({ agent: agent7 }, async () => ({ kind: "enter", messages: msgs }));
+    return (decision?.messages || [])
+      .map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || "")))
+      .join(String.fromCharCode(10));
+  };
+  const t7a = await run7([{ role: "user", content: [{ type: "text", text: "邮件那件事你还记得吗" }] }]);
+  ok("有他的话时正常抛回忆", t7a.includes("<puppet_cue>"), t7a.slice(0, 80));
+  const t7b = await run7([]);
+  ok("空 messages 时回落上次的话，但同一句不重复抛", !t7b.includes("<puppet_cue>"), t7b.slice(0, 80));
+  ok("回落后记下了「已为这句话抛过」", fs.existsSync(path.join(TMP, "state", "cue-last-seen.json")), "state/cue-last-seen.json 不存在");
+
   // ---- 新规矩（2026-10-29）：待判不挡取词；上一段没表态就作废（独立会话 cue-s4 验）
   const agent4 = { session: { header: { id: "cue-s4", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
   const run4 = async (userText) => {
