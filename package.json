@@ -14,6 +14,8 @@
     "rules.js",
     "searchindex.js",
     "cueprompt.js",
+    "words.js",
+    "words-dict.json",
     "client.js",
     "social.js",
     "state.js",

@@ -16,6 +16,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { matchScore, termsOf } from "./words.js";
 
 const DAY = 86400000;
 const MISRECALL_TTL = 30 * DAY;
@@ -98,11 +99,12 @@ export function stripInjected(text) {
 export function worthCueing(text) {
   const t = stripInjected(text);
   const han = (t.match(/[一-鿿]/g) || []).length;
-  const latin = (t.match(/[A-Za-z]{2,}/g) || []).length;
-  if (han + latin < 4) return { ok: false, reason: "太短（不足 4 个字/词）" };
-  const grams = bigramsOf(t);
-  if (grams.length < 2) return { ok: false, reason: "没有可取的二字词" };
-  return { ok: true, grams: grams.length, han };
+  const words = termsOf(t).filter((w) => /[一-鿿]/.test(w)); // 只认中文词：英文上下文块不算他的话
+  if (!words.length) return { ok: false, reason: "没有中文词" };
+  if (words.length < 2 && han < 8) {
+    return { ok: false, reason: `只有 1 个中文词（${words[0]}），太短` };
+  }
+  return { ok: true, words: words.length, han };
 }
 
 /** 自我复述（第二道闸）：候选条目本身≈他这句话时，那不是「回忆」，是把他的话存了一遍 */
@@ -232,7 +234,8 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
    * @returns {{candidates:Array<{hash:string,text:string,where:string,kind:string,importantId?:string}>, blocked:number, fromImportant:number, fromNormal:number}}
    */
   function pickCandidates({ userText, searchFn = null, limit = 7 } = {}) {
-    const grams = new Set(bigramsOf(userText));
+    const userTerms = new Set(termsOf(userText));
+    const grams = userTerms; // 兼容旧命名（下面还有分支在用）
     const blocked = misrecallSet();
     const out = [];
     let blockedCount = 0;
@@ -255,8 +258,8 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
         if (out.length >= limit || taken >= 2) break;
         const text = `${g.topic || ""} ${g.summary || ""}`;
         if (!String(g.summary || "").trim()) continue;
-        const shared = bigramsOf(text).filter((x) => grams.has(x)).length;
-        if (shared < 2) continue;
+        // 按「词表命中的词按字数 + 弱二字词」计分，≥4 才算真重合（丹阳 2026-10-29：分词之后别再按字数硬套）
+        if (matchScore(userText, text) < 4) continue;
         taken += 1;
         out.push({
           hash: `ev:${g.key}`,
@@ -271,8 +274,8 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     // ② 重要库：主题词/引用条目的关键词有重合就拿出来
     for (const imp of importantAll()) {
       if (String(imp.state || "active") !== "active") continue;
-      const words = bigramsOf(`${imp.topic || ""} ${(imp.refs || []).join(" ")}`);
-      const shared = words.some((g) => grams.has(g));
+      const words = termsOf(`${imp.topic || ""} ${(imp.refs || []).join(" ")}`);
+      const shared = words.some((g) => userTerms.has(g));
       if (!shared) continue;
       if ((imp.refs || []).some((h) => isBlocked(h, imp.topic, blocked))) {
         blockedCount += 1;
