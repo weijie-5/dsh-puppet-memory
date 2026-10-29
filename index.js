@@ -35,6 +35,8 @@ import zlib from "node:zlib";
 import { createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths } from "./social.js";
 import { behaviorHint, createLines, lastUserText, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens } from "./state.js";
 import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPaths } from "./sessionmem.js";
+import { createSearchIndex, sqliteAvailable, sqliteUnavailableReason } from "./searchindex.js";
+import { bigramsOf, createCuePrompter, stripInjected, verdictOf } from "./cueprompt.js";
 import { createRules, formatRuleRow, parseRulesMarkdown, rulesDefaults } from "./rules.js";
 
 const PLUGIN_NAME = "dsh-puppet-memory";
@@ -651,6 +653,16 @@ function defaultConfig() {
     // v0.34（B-52）：要点层。检索结果顶部先给几条「要点 + hash」速览，扫一眼就知道要不要读原文。
     // 抽取式：只取第一句，不调模型、不花 token，也没有额外存储。
     brief: { enabled: true, prependHits: 3, maxChars: 60 },
+    // v0.38（B-86）：到期提醒。只做「欠着的事」一种——条目带 until 且已过 → 注入一条汇总（零模型调用）。
+    // 每条只推一次（推过的 hash 记在 state/due.json），一天最多推一条汇总块；默认关，开了才会推。
+    due: { enabled: false, maxItems: 3, maxChars: 140 },
+    // v0.38（B-70）：检索走哪条路。scan=每次扫 JSONL（默认，行为跟以前一模一样）；
+    // sqlite=用 state/search-index.sqlite 这份派生索引拿候选（按文件增量重建，删了会自动重放）。
+    // 默认 scan：新路径必须先在真数据上跑赢、跑稳才改默认（0.37.0 的教训）。
+    search: { engine: "scan" },
+    // v0.39（B-94）：取词器 + 提词器。默认关——它每回合要调一次小模型判「这算不算回忆」。
+    // 取词器只管取（重要库优先），提词器只管判 + 给一句自然语言提示，不贴资料块。
+    cueprompt: { enabled: false, maxCandidates: 7, maxHintChars: 140, model: null },
     // 多人记忆（v0.21 骨架）：默认关闭注入。关着时工具仍可显式读写 social/，但一个字都不注入。
     // 只有 enabled=true 且能从 session header 认出场景（群/私聊 + 对象）时，才按场景注入档案。
     social: socialConfigDefaults(),
@@ -676,6 +688,9 @@ function loadConfig() {
   merged.writeGuard = { ...defaultConfig().writeGuard, ...(cfg.writeGuard || {}) };
   merged.writeGuard.maxChars = { ...defaultConfig().writeGuard.maxChars, ...((cfg.writeGuard && cfg.writeGuard.maxChars) || {}) };
   merged.brief = { ...defaultConfig().brief, ...(cfg.brief || {}) };
+  merged.due = { ...defaultConfig().due, ...(cfg.due || {}) };
+  merged.search = { ...defaultConfig().search, ...(cfg.search || {}) };
+  merged.cueprompt = { ...defaultConfig().cueprompt, ...(cfg.cueprompt || {}) };
   merged.social = { ...defaultConfig().social, ...(cfg.social || {}) };
   merged.social.sceneKeys = { ...defaultConfig().social.sceneKeys, ...((cfg.social && cfg.social.sceneKeys) || {}) };
   merged.lines = { ...defaultConfig().lines, ...(cfg.lines || {}) };
@@ -1260,6 +1275,97 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now() } = {}) {
     "以下是按你这句话里的关键词顺手取回的几条记忆（不是全部；要细节用 memory_search）：",
     clip(lines.join("\n"), 300),
     "</puppet_recall>",
+  ].join("\n");
+}
+
+/**
+ * v0.38（B-86）：到期提醒——只做「欠着的事」一种。
+ * 条目带 until 且时间已经过了 → 汇总成一块注入（零模型调用，不加新数据格式）。
+ * 纪律：到期的必推、没到期的一条都不推、每条只推一次（hash 记在 state/due.json）、
+ * 一天最多推一条汇总块。开关 config.due.enabled，默认关。
+ */
+function localDayKey(nowMs) {
+  const d = new Date(nowMs);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function localMonthDay(nowMs) {
+  const d = new Date(nowMs);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 扫描各层里「带 until 且已过期」的生效条目（标废的不算）。 */
+function collectDueEntries(nowMs) {
+  const out = [];
+  const sources = [
+    ["relation", PATHS.relations, (e) => (e.keyword && e.meaning ? `${e.keyword}：${e.meaning}` : e.keyword || e.meaning)],
+    ["user", PATHS.user, (e) => (e.keyword ? `${e.keyword}：${e.text}` : e.text)],
+    ["note", PATHS.notes, (e) => e.text],
+    ["memo", PATHS.memo, (e) => e.text],
+    ["saying", PATHS.sayings, (e) => (e.keyword && e.meaning ? `${e.keyword}：${e.meaning}` : e.text)],
+  ];
+  for (const [layer, file, textOf] of sources) {
+    let rows = [];
+    try {
+      rows = readJsonl(file);
+    } catch {
+      continue;
+    }
+    for (const e of rows) {
+      if (!e || e.voided) continue;
+      const raw = String(e.until || "").trim();
+      if (!raw) continue;
+      const until = Date.parse(raw);
+      if (!Number.isFinite(until) || until > nowMs) continue;
+      const text = String(textOf(e) || "").replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      out.push({ layer, hash: String(e.hash || ""), until, text });
+    }
+  }
+  return out;
+}
+
+function buildDueInjection(cfg, { nowMs = Date.now(), persist = true } = {}) {
+  const opt = { ...defaultConfig().due, ...(cfg?.due || {}) };
+  if (opt.enabled !== true) return "";
+  const state = loadState() || {};
+  const book = state.due && typeof state.due === "object" ? state.due : {};
+  const today = localDayKey(nowMs);
+  if (book.lastDay === today) return ""; // 一天最多一条汇总
+  const already = new Set(Array.isArray(book.notified) ? book.notified.map(String) : []);
+  let due = [];
+  try {
+    due = collectDueEntries(nowMs);
+  } catch {
+    return "";
+  }
+  due = due.filter((x) => x.hash && !already.has(x.hash));
+  if (!due.length) return "";
+  due.sort((a, b) => a.until - b.until);
+  const maxItems = Math.max(1, Math.min(6, Number(opt.maxItems) || 3));
+  const shown = due.slice(0, maxItems);
+  const lines = shown.map((x) => `· 到期 ${localMonthDay(x.until)}｜${clip(x.text, 60)}`);
+  const rest = due.length - shown.length;
+  const head = lines.join("\n");
+  const more = rest > 0 ? `\n（还有 ${rest} 条也到期了，用 memory_search 查）` : "";
+  const body = clip(`${head}${more}`, Math.max(60, Number(opt.maxChars) || 140));
+  if (persist) {
+    try {
+      book.lastDay = today;
+      book.notified = [...already, ...shown.map((x) => x.hash)].slice(-300);
+      state.due = book;
+      saveState(state);
+    } catch {
+      /* 记不住就少推一次，不影响注入本身 */
+    }
+  }
+  return [
+    "<puppet_due>",
+    "以下是你欠着的事，时间到了（插件按条目的到期时间推的一次性提醒，不是用户消息；处理完就不用再提）：",
+    body,
+    "</puppet_due>",
   ].join("\n");
 }
 
@@ -2642,6 +2748,217 @@ function ensureSearchIndex() {
   return SEARCH_INDEX;
 }
 
+// ---------------- v0.39（B-94）：取词器 + 提词器 ----------------
+let cuePrompterSingleton = null;
+function cuePrompterFor() {
+  if (!cuePrompterSingleton) cuePrompterSingleton = createCuePrompter({ memDir: MEM_DIR });
+  return cuePrompterSingleton;
+}
+// 上一回合发出去的回忆：等对方下一句话来判成败。**落盘在 state/cue-pending.json**——
+// 原来只在内存 Map 里，宿主一重启就丢，闭环直接断（2026-10-29 实测踩到）。
+
+/** v0.39（B-94 ③④）：按 hash 前缀找回条目本体（要它的门牌） */
+function entryByHashPrefix(prefix) {
+  const p = String(prefix || "").trim().toLowerCase();
+  if (p.length < 6) return null;
+  for (const file of searchTargets("all")) {
+    if (!fs.existsSync(file)) continue;
+    let text = "";
+    try {
+      text = readText(file);
+    } catch {
+      continue;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const entry = parseJsonlLine(line);
+      const h = String(entry?.hash || "").toLowerCase();
+      if (h && h.startsWith(p)) return { entry, file };
+    }
+  }
+  return null;
+}
+
+/** v0.39（B-94 ③）：反对之后回原文——有门牌就取那一段，没门牌就说明「位置未知」，不猜 */
+function verifyExcerptOf(hash) {
+  const found = entryByHashPrefix(hash);
+  if (!found) return { text: "", gate: "找不到条目本体（可能在归档里）" };
+  const entry = found.entry || {};
+  const session = String(entry.session || "");
+  if (!session) return { text: "", gate: "位置未知（这条没记会话/序号，不许猜）" };
+  try {
+    const seqFrom = Number.isInteger(entry.seqFrom) ? entry.seqFrom : null;
+    const seqTo = Number.isInteger(entry.seqTo) ? entry.seqTo : null;
+    const out = recallSession({ session, ...(seqFrom !== null ? { seqFrom, seqTo } : {}), limit: 8 });
+    return { text: String(out || "").slice(0, 320), gate: seqFrom !== null ? `会话 ${session} · 事件 #${seqFrom}–#${seqTo}` : `会话 ${session}（序号未知）` };
+  } catch (err) {
+    return { text: "", gate: `取原文失败：${err?.message || err}` };
+  }
+}
+
+/** 把 memory_search 的文本结果转成提词器的候选（只要 hash/摘要/来源） */
+function cueHitsOf(query, n = 7) {
+  try {
+    const text = String(searchMemory(query, { limit: n }));
+    const out = [];
+    for (const line of text.split(/\r?\n/)) {
+      const m = line.match(/#([0-9a-f]{8})/);
+      if (!m) continue;
+      const where = (line.match(/^(\S+\.jsonl):/) || [null, "search"])[1];
+      out.push({ hash: m[1], text: line.replace(/\s+/g, " ").slice(0, 200), where });
+      if (out.length >= n) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// ---------------- v0.38（B-70）：SQLite 派生索引（可选引擎，默认关） ----------------
+// 只当索引：真源还是 JSONL。它删了会从 JSONL 重放；坏了一律退回全量扫，不让检索失败。
+let sqliteStoreCache = null;
+let sqliteLastError = "";
+let sqliteLastSync = null;
+
+function searchEngineOf(cfg = null) {
+  // 诊断/A-B 用：DSH_MEMORY_SEARCH_ENGINE=scan|sqlite 可以临时盖过配置，不改 config.json
+  const env = String(process.env.DSH_MEMORY_SEARCH_ENGINE || "").trim().toLowerCase();
+  if (env === "scan" || env === "sqlite") return env;
+  try {
+    const c = cfg || loadConfig();
+    return String(c?.search?.engine || "scan") === "sqlite" ? "sqlite" : "scan";
+  } catch {
+    return "scan";
+  }
+}
+
+function sqliteSearchStore() {
+  if (sqliteStoreCache) return sqliteStoreCache;
+  if (!sqliteAvailable()) throw new Error(sqliteUnavailableReason());
+  sqliteStoreCache = createSearchIndex({ dbPath: path.join(PATHS.stateDir, "search-index.sqlite") });
+  return sqliteStoreCache;
+}
+
+function closeSearchIndex() {
+  if (!sqliteStoreCache) return;
+  try {
+    sqliteStoreCache.close();
+  } catch {
+    /* 关不掉也不影响退出 */
+  }
+  sqliteStoreCache = null;
+}
+
+function fileSigOf(file) {
+  try {
+    const st = fs.statSync(file);
+    return `${st.size}:${Math.round(st.mtimeMs)}`;
+  } catch {
+    return "";
+  }
+}
+
+function searchRowsOfFile(file, relPath) {
+  const rows = [];
+  let text = "";
+  try {
+    text = readText(file);
+  } catch {
+    return rows;
+  }
+  text.split(/\r?\n/).forEach((line, index) => {
+    if (!line.trim()) return;
+    const entry = parseJsonlLine(line);
+    const toks = searchTokensOf(searchableTextOf(entry, line));
+    rows.push({
+      key: `${relPath}#${index + 1}`,
+      lineNo: index + 1,
+      line,
+      ts: Date.parse(entry?.ts || "") || 0,
+      hash: entry?.hash ? String(entry.hash) : "",
+      supersedes: Array.isArray(entry?.supersedes) ? entry.supersedes.map(String).join(",") : "",
+      until: entry?.until ? String(entry.until) : "",
+      voided: !!entry?.voided,
+      toks,
+    });
+  });
+  return rows;
+}
+
+/** 把 JSONL 按文件同步进索引：签名没变的文件不读不解析（rows 是 thunk，只有真要重建时才调用）。 */
+function syncSqliteSearchStore(store) {
+  const snapshot = [];
+  for (const file of new Set(searchTargets("all"))) {
+    const sig = fileSigOf(file);
+    if (!sig) continue; // 文件不存在 → 不放进快照，已有记录会被当作「文件消失」清掉
+    const relPath = rel(file);
+    snapshot.push({ rel: relPath, sig, rows: () => searchRowsOfFile(file, relPath) });
+  }
+  const result = store.sync(snapshot);
+  sqliteLastSync = result;
+  return result;
+}
+
+/** 从索引取候选，还原成 scan 引擎同形状的 doc（排序逻辑一点没动，只是候选来自倒排表）。 */
+function sqliteCandidateDocs(store, tokens, qTokens, now) {
+  const stats = store.stats();
+  const terms = [...new Set([...qTokens, ...tokens])];
+  const { hits, df } = store.candidates(terms);
+  const supersededBy = new Map();
+  for (const pair of store.supersedesPairs()) {
+    const olds = String(pair.supersedes || "").split(",").filter(Boolean);
+    for (const oldHash of olds) {
+      supersededBy.set(oldHash, {
+        reason: `被 #${String(pair.hash || "").slice(0, 8)} 取代`,
+        at: "",
+        by: String(pair.hash || ""),
+      });
+    }
+  }
+  const docs = [];
+  if (hits.size) {
+    for (const row of store.docsByKeys(hits.keys())) {
+      const entry = parseJsonlLine(row.line);
+      // 分词结果存在索引里，这里直接取——每次检索重新分词候选是 sqlite 路径最贵的一步
+      const toks = String(row.toks || "").split(" ").filter(Boolean);
+      docs.push({
+        file: path.join(MEM_DIR, row.rel),
+        lineNo: row.line_no,
+        line: row.line,
+        low: row.line.toLowerCase(),
+        entry,
+        toks,
+        len: toks.length,
+        ts: Number(row.ts) || 0,
+        ended: endedInfoOf(entry, supersededBy, now),
+      });
+    }
+  }
+  return { docs, df, N: stats.docs, avgdl: stats.avgdl };
+}
+
+/** 索引现状（给 memory_stats / 诊断用；不建库、不写盘） */
+function searchIndexStatus(cfg = null) {
+  const engine = searchEngineOf(cfg);
+  const out = { engine, available: sqliteAvailable(), error: sqliteUnavailableReason() || "", docs: 0, terms: 0, ms: null, path: "" };
+  try {
+    const store = sqliteSearchStore();
+    const stats = store.stats();
+    out.path = store.path;
+    out.docs = stats.docs;
+    out.terms = stats.terms;
+    out.ms = sqliteLastSync ? sqliteLastSync.ms : null;
+  } catch (err) {
+    out.error = err?.message || String(err);
+  }
+  if (sqliteLastSync) {
+    out.rebuilt = sqliteLastSync.rebuilt.length;
+    out.removed = sqliteLastSync.removed.length;
+    out.skipped = sqliteLastSync.skipped;
+  }
+  return out;
+}
+
 // BM25：只对查询里出现的 token 计分（词频 × idf × 长度归一化）
 function bm25ScoreOf(doc, qTokens, index) {
   const counts = new Map();
@@ -2784,7 +3101,6 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     }
     return "缺少 query 或 tag 参数；layer=memo 或 layer=user 时可不传，直接列出该层";
   }
-  const index = ensureSearchIndex();
   const allowed = new Set();
   for (const one of layerList) for (const file of searchTargets(one)) allowed.add(file);
   // v0.36（A-79）：日记按月预筛——只扫「guide 里有候选关键词」的月份
@@ -2794,9 +3110,34 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
       : null;
 
   const qTokens = new Set(searchTokensOf(q));
+  // v0.38（B-70）：默认全量扫；config.search.engine=sqlite 时走派生索引。
+  // 任何异常（库坏了 / node:sqlite 不可用 / 查不出 token）都静默退回扫——检索绝不能因此失败。
+  let docsToScan = [];
+  let scoreIndex = null;
+  let engineUsed = "scan";
+  const wantSqlite = searchEngineOf() === "sqlite" && sqliteAvailable() && qTokens.size > 0;
+  if (wantSqlite) {
+    try {
+      const store = sqliteSearchStore();
+      syncSqliteSearchStore(store);
+      const got = sqliteCandidateDocs(store, tokens, qTokens, Date.now());
+      docsToScan = got.docs;
+      scoreIndex = { df: got.df, N: got.N, avgdl: got.avgdl };
+      engineUsed = "sqlite";
+    } catch (err) {
+      sqliteLastError = err?.message || String(err);
+      diag(`SQLite 检索索引不可用，退回全量扫：${sqliteLastError}`);
+    }
+  }
+  if (engineUsed !== "sqlite") {
+    const scanIndex = ensureSearchIndex();
+    docsToScan = scanIndex.docs;
+    scoreIndex = scanIndex;
+  }
+
   const candidates = [];
   const now = Date.now();
-  for (const doc of index.docs) {
+  for (const doc of docsToScan) {
     if (!allowed.has(doc.file)) continue;
     if (diaryPre && diaryPre.size) {
       const relPath = rel(doc.file);
@@ -2837,7 +3178,7 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
       }
       if (!anyGram) continue;
     }
-    let score = bm25ScoreOf(doc, qTokens, index);
+    let score = bm25ScoreOf(doc, qTokens, scoreIndex);
     // 整词全中给一点加成：精确词（编号、人名、英文）仍应排在模糊匹配前面
     if (tokens.length && kwMatched === tokens.length) score += 1;
     const tsMs = doc.ts;
@@ -3025,8 +3366,15 @@ function locateMemory(args) {
         const voidNote = entry?.voided
           ? `  〔已标废：${entry.voided.reason || "无原因"}　${String(entry.voided.at || "").slice(0, 16)}〕`
           : "";
+        // v0.39（B-93）门牌：能精确就写精确位置；拿不到就写「位置未知」，绝不猜
+        const gate =
+          entry?.session && Number.isInteger(entry?.seqFrom)
+            ? `\n  门牌：会话 ${entry.session} · 事件 #${entry.seqFrom}–#${entry.seqTo}（回原文：memory_recall session=${entry.session} seqFrom=${entry.seqFrom} seqTo=${entry.seqTo}）`
+            : entry?.session
+              ? `\n  门牌：只知道会话 ${entry.session}，序号未知（回原文：memory_recall session=${entry.session}，别猜位置）`
+              : `\n  门牌：位置未知（这条没记会话/序号，不猜；可用 memory_search 找相邻记录）`;
         out.push(
-          `${where}:${index + 1}  [${kind}${entry?.keyword ? ` · ${entry.keyword}` : ""}]  hash=${entry?.hash || "无"}${provenance ? `  ${provenance}` : ""}${voidNote}\n  ${clip(line, 800)}`,
+          `${where}:${index + 1}  [${kind}${entry?.keyword ? ` · ${entry.keyword}` : ""}]  hash=${entry?.hash || "无"}${provenance ? `  ${provenance}` : ""}${voidNote}${gate}\n  ${clip(line, 800)}`,
         );
       });
   }
@@ -3192,9 +3540,19 @@ function listSessions(limit) {
     .join("\n");
 }
 
+/** v0.39（B-93）：按事件序号区间筛消息（门牌指到哪就取哪一段） */
+function filterMsgsBySeq(msgs, from, to) {
+  const lo = Number.isInteger(from) ? from : -Infinity;
+  const hi = Number.isInteger(to) ? to : Infinity;
+  return (msgs || []).filter((m) => Number.isInteger(m?.seq) && m.seq >= lo && m.seq <= hi);
+}
+
 function recallSession(args) {
   const wanted = String(args?.session || "").trim();
   const limit = Math.max(1, Math.min(200, Number(args?.limit) || 30));
+  // v0.39（B-93）门牌回原文：给了序号区间就只取那几句
+  const seqFrom = Number.isInteger(Number(args?.seqFrom)) ? Number(args.seqFrom) : null;
+  const seqTo = Number.isInteger(Number(args?.seqTo)) ? Number(args.seqTo) : null;
   if (!wanted || wanted === "list") return listSessions(limit);
   const id = wanted.replace(/^session-/, "");
   // v0.36（B-61）：宿主文件不在了就回落到归档副本——宿主清了原文也读得回来
@@ -3209,19 +3567,24 @@ function recallSession(args) {
     if (!ev) continue;
     if (ev.type === "user/message" && ev.data?.source?.kind === "user") {
       const text = messageText(ev.data);
-      if (text) msgs.push({ role: "用户", text });
+      if (text) msgs.push({ role: "用户", text, seq: Number(ev.seq) });
     } else if (ev.type === "assistant/message") {
       const text = messageText(ev.data?.message ?? ev.data);
-      if (text) msgs.push({ role: "我", text });
+      if (text) msgs.push({ role: "我", text, seq: Number(ev.seq) });
     }
   }
   if (!msgs.length) return `会话 ${id} 里没有找到对话文本（事件 ${events.length} 条）。`;
+  const byGate = seqFrom !== null || seqTo !== null ? filterMsgsBySeq(msgs, seqFrom, seqTo) : msgs;
+  if ((seqFrom !== null || seqTo !== null) && !byGate.length) {
+    return `会话 ${id} 里 #${seqFrom ?? "?"}–#${seqTo ?? "?"} 这段没有对话文本（门牌指的是事件序号，可能是工具调用或注入块）。`;
+  }
   const query = String(args?.query || "").trim().toLowerCase();
-  const hits = query ? msgs.filter((m) => m.text.toLowerCase().includes(query)) : msgs.slice(-limit);
+  const hits = query ? byGate.filter((m) => m.text.toLowerCase().includes(query)) : byGate.slice(-limit);
   if (!hits.length) return `会话 ${id}（${msgs.length} 条消息）里没有含「${args.query}」的内容。`;
   const picked = hits.slice(-limit);
-  const head = `会话 ${id}：${msgs.length} 条对话，${query ? `命中「${args.query}」` : "取最近"} ${picked.length} 条：`;
-  return [head, ...picked.map((m) => `[${m.role}] ${clip(m.text.replace(/\s+/g, " "), 240)}`)].join("\n");
+  const gateNote = seqFrom !== null || seqTo !== null ? `（按门牌 #${seqFrom ?? "?"}–#${seqTo ?? "?"} 取原文）` : "";
+  const head = `会话 ${id}${gateNote}：${msgs.length} 条对话，${query ? `命中「${args.query}」` : "取最近"} ${picked.length} 条：`;
+  return [head, ...picked.map((m) => `[${m.role}${Number.isInteger(m.seq) ? ` #${m.seq}` : ""}] ${clip(m.text.replace(/\s+/g, " "), 240)}`)].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -4579,12 +4942,22 @@ function writeMemory(args) {
   const userNote = String(args.note || "").trim();
   // 原文 / 转述：文字条目和资产出处都存这个标记，显示时用来区分「照抄原话」还是「自己概括」
   const quote = cleanQuote(args.quote);
+  // v0.38（B-86）：到期时间。只写一个 until 字段（不传就不写，老数据零迁移）；
+  // 过期后读时推导成「已结束：到期」，并由到期提醒最多推一次。
+  const untilRaw = String(args.until || "").trim();
+  let untilISO = "";
+  if (untilRaw) {
+    const untilMs = parseTimeBound(untilRaw, true);
+    if (Number.isNaN(untilMs)) return `until 不是合法日期：「${untilRaw}」。用 YYYY-MM-DD 或带时区的 ISO。`;
+    untilISO = new Date(untilMs).toISOString();
+  }
   // v0.33（B-32）：三态标记——做过（有回执）/ 没做成（有失败原因）/ 听说（别人转述，未验证）
   const markState = (entry) => {
     const st = stateOf(args.state);
     if (st) entry.state = st;
     const proof = String(args.proof || "").trim();
     if (proof) entry.proof = clip(proof, 160);
+    if (untilISO) entry.until = untilISO;
     return entry;
   };
 
@@ -4625,6 +4998,7 @@ function writeMemory(args) {
       if (!entry.quote && old.quote) entry.quote = old.quote;
       if (!entry.state && old.state) entry.state = old.state;
       if (!entry.proof && old.proof) entry.proof = old.proof;
+      if (!untilISO && old.until) entry.until = old.until; // 改写条目时到期时间不会莫名丢
       if (old.voided && !entry.voided) entry.voided = old.voided; // 标废是状态，不因内容更新而消失
       const relAliases = mergeAliases(entry.aliases, old.aliases);
       if (relAliases.length) entry.aliases = relAliases; else delete entry.aliases;
@@ -4674,6 +5048,7 @@ function writeMemory(args) {
       if (!entry.quote && old.quote) entry.quote = old.quote;
       if (!entry.state && old.state) entry.state = old.state;
       if (!entry.proof && old.proof) entry.proof = old.proof;
+      if (!untilISO && old.until) entry.until = old.until; // 改写条目时到期时间不会莫名丢
       if (old.voided && !entry.voided) entry.voided = old.voided;
       const merged = mergeTags(entry.tags, old.tags);
       if (merged.length) entry.tags = merged; else delete entry.tags;
@@ -4794,6 +5169,7 @@ function writeMemory(args) {
       if (!entry.quote && old.quote) entry.quote = old.quote;
       if (!entry.state && old.state) entry.state = old.state;
       if (!entry.proof && old.proof) entry.proof = old.proof;
+      if (!untilISO && old.until) entry.until = old.until; // 改写条目时到期时间不会莫名丢
       if (old.voided && !entry.voided) entry.voided = old.voided;
       const sayAliases = mergeAliases(entry.aliases, old.aliases);
       if (sayAliases.length) entry.aliases = sayAliases; else delete entry.aliases;
@@ -4890,10 +5266,16 @@ function writeTurnDiary(agent, events) {
   const keywords = keywordsOf(`${turn.user} ${turn.assistant}`);
   const diaryFile = path.join(PATHS.diaryDir, `${monthKey()}.jsonl`);
 
+  // v0.39（B-93）门牌：把「这条日记出自哪几句原始事件」记下来，回原文时不用猜。
+  // 拿不到 seq 就明确标 whereUnknown，绝不编一个位置（错的门牌比没有更坏）。
+  const seqs = (Array.isArray(events) ? events : []).map((e) => Number(e?.seq)).filter((n) => Number.isInteger(n) && n >= 0);
+  const seqFrom = seqs.length ? Math.min(...seqs) : null;
+  const seqTo = seqs.length ? Math.max(...seqs) : null;
   const diaryEntry = {
     kind: "turn",
     ts,
     session: sessionId,
+    ...(seqFrom !== null ? { seqFrom, seqTo, where: `${sessionId}#${seqFrom}-${seqTo}` } : { whereUnknown: true }),
     cwd,
     user: clip(turn.user, 240),
     assistant: clip(turn.assistant, 240),
@@ -5919,14 +6301,86 @@ function apply(ctx) {
         // v0.37（B-84 / B-88）：事件触发取记忆 + open 交接纸条。各自独立成块，内容不变不重复。
         let handoffText = "";
         let recallText = "";
+        let dueText = "";
+        let cueText = "";
         try {
           if (!suppressed.has("handoff")) handoffText = buildHandoffInjection(cfg);
           if (!suppressed.has("recall")) {
-            const userText = lastUserText(decision.messages || []).text;
+            // 他发的话前面常挂着 <system-reminder>（注入块不是他说的），取词/召回前先剥掉
+            const userText = stripInjected(lastUserText(decision.messages || []).text);
             recallText = buildRecallInjection(cfg, userText);
           }
+          // v0.38（B-86）：到期的欠着的事（默认关；一天最多推一条汇总，每条只推一次）
+          if (!suppressed.has("due")) dueText = buildDueInjection(cfg);
+
+          // v0.39（B-94）：取词器 + 提词器。默认关；开着时每回合可能多一次小模型调用。
+          if (cfg.cueprompt?.enabled) {
+            const userText = stripInjected(lastUserText(decision.messages || []).text);
+            const cp = cuePrompterFor();
+            const pending = cp.loadPending(sessionId);
+            let cueHandledThisTurn = false; // 一回合只做一件事：判了成败/摆了原文，就不再新取词
+            if (pending?.hash && userText) {
+              const verdict = verdictOf(userText);
+              if (verdict !== "silent") {
+                cp.applyVerdict({ hash: pending.hash, importantId: pending.importantId || "", topic: pending.topic || "", verdict, session: sessionId });
+                cp.recordEvent({ session: sessionId, pick: pending, candidates: pending.candidates || [], verdict });
+                diag(`回忆判定：${verdict}（#${String(pending.hash || "").slice(0, 8)}）`);
+                // ③④ 闭环：被反对 → 立刻回原文核对，本轮就把原话摆出来再回答
+                if (verdict === "objected") {
+                  const ex = verifyExcerptOf(pending.hash);
+                  const rows = [
+                    "（你上次说「不是这个」——也就是我说偏了。下面是原文，对照一下再回答，别再用「记不清」结案）",
+                    `门牌：${ex.gate}`,
+                  ];
+                  if (ex.text) rows.push(`原文摘录：\n${ex.text}`);
+                  else rows.push("原文取不到 → 老实说「我查不到那段原话」，不要编。");
+                  rows.push("核对完二选一：原文支持我 → 修正表述重说一遍；原文不支持 → 用 memory_cue demote 把这条降级。");
+                  cueText = ["<puppet_verify>", rows.join("\n"), "</puppet_verify>"].join("\n");
+                  diag(`反对后回原文：${ex.text ? "取到" : "没取到"}（${ex.gate}）`);
+                }
+                cp.clearPending(sessionId);
+                cueHandledThisTurn = true;
+              }
+            }
+            if (!cueText && !cueHandledThisTurn && !cp.loadPending(sessionId) && String(userText || "").trim().length >= 2) {
+              const picked = cp.pickCandidates({
+                userText,
+                searchFn: (q, n) => cueHitsOf(q, n),
+                limit: Number(cfg.cueprompt.maxCandidates) || 7,
+              });
+              diag(`取词：候选 ${picked.candidates.length}（重要 ${picked.fromImportant} / 常规 ${picked.fromNormal} / 记错跳过 ${picked.blocked}）`);
+              // 路由要从会话 header 取：不传 session 时宿主里拿不到默认模型，caller 会是 null（实测踩到）
+              const caller = picked.candidates.length
+                ? createLlmCaller({ session: agent?.session || null, model: cfg.cueprompt.model || null })
+                : null;
+              if (picked.candidates.length && !caller) {
+                let hasLlm = false;
+                try {
+                  hasLlm = Boolean(typeof ctx.get === "function" ? ctx.get("llm") : ctx.llm);
+                } catch {
+                  hasLlm = false;
+                }
+                diag(`提词：拿不到模型调用器（llm 服务=${hasLlm ? "有" : "无"}、session=${agent?.session ? "有" : "无"}）`);
+              }
+              if (caller) {
+                const judged = await cp.judge({
+                  userText,
+                  candidates: picked.candidates,
+                  maxHintChars: Number(cfg.cueprompt.maxHintChars) || 140,
+                  callModel: ({ system, user }) => caller({ prompt: `${system}\n\n${user}`, maxTokens: 500, timeoutMs: 15000 }),
+                });
+                diag(`提词：${judged.pick ? "判定为回忆" : "判为不构成回忆"}${judged.error ? `（错误：${judged.error}）` : ""}${judged.hint ? ` hint=${clip(judged.hint, 40)}` : ""}`);
+                if (judged.pick) {
+                  cp.savePending(sessionId, { ...judged.pick, topic: "", candidates: picked.candidates });
+                  const rows = ["（提示：这件事你和他之前聊过。若自然就用平常语气带出来，别罗列资料、别贴编号）", judged.hint];
+                  if (judged.question) rows.push(`（拿不准可以先问一句：${judged.question}）`);
+                  cueText = ["<puppet_cue>", rows.join("\n"), "</puppet_cue>"].join("\n");
+                }
+              }
+            }
+          }
         } catch (err) {
-          diag(`交接/召回注入失败：${err?.message || err}`);
+          diag(`交接/召回/到期注入失败：${err?.message || err}`);
         }
         // v0.21 多人记忆骨架：社交档案注入（默认关；认不出场景就不注入，宁可少说也不串台）
         let socialText = "";
@@ -5940,8 +6394,8 @@ function apply(ctx) {
         } catch (err) {
           diag(`社交档案注入失败：${err?.message || err}`);
         }
-        if (!text && !socialText && !handoffText && !recallText && !rulesForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
-        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${rulesForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
+        if (!text && !socialText && !handoffText && !recallText && !dueText && !cueText && !rulesForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
+        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}\u0000${cueText}\u0000${rulesForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
         if (lastInjected.get(sessionId) === digest) {
           if (injectMode === "first-step") injectedOnce.add(sessionId);
           return decision;
@@ -5984,9 +6438,11 @@ function apply(ctx) {
           : null;
         const handoffMessage = handoffText ? injectionMessage(handoffText) : null;
         const recallMessage = recallText ? injectionMessage(recallText) : null;
+        const dueMessage = dueText ? injectionMessage(dueText) : null;
+        const cueMessage = cueText ? injectionMessage(cueText) : null;
         return {
           kind: "enter",
-          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
+          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
         };
       } catch (err) {
         log("warn", `pre-step 注入失败：${err?.message || err}`);
@@ -6135,7 +6591,7 @@ function apply(ctx) {
 
       name: "memory_write",
       description:
-        "写入一条长期记忆。layer=relation（关键词-释义对，如称呼/爱好/旧账，每轮注入，常用的放这里）| user（用户档案：兴趣爱好、习惯、背景资料等，不常注入，需要时用 memory_search layer=user 查）| memo（便签：工作交接、临时草稿，可随时清空）| note（临时笔记）| saying（常言/口头禅的细节解释）| persona（人设设定）| diary（日记条目）。重要的事一定要写进来，否则下次会话不会记得。出处：source 记「谁说的/在哪看到的」（如「UP主@BV号」），quote 标原文（verbatim）还是转述（paraphrase）；找不到出处就留空，不编造。images/audios 可带本地图片或音频路径（音频支持 mp3/wav/m4a/aac/ogg/opus/flac/webm/amr），一起存进记忆资产库（适合人物设定、截图、示意图、语音片段），带 source 时会顺手登记资产出处。tags 可给条目打分类标签（除 persona 外都支持，更新时旧标签自动保留合并；写 -标签 表示删除该标签），只接受固定词表，词表外会被忽略。梗/口头禅/网络传说类请用 saying 层，关系层只放人和关系。diary 可加 important=true 标重要事件。note 可写备注（跟条目一起落盘并写进 guide 索引）；state 标记这条记忆的可信状态（做过 / 没做成 / 听说，配 proof 写依据），不标就是不标；写入返回里的 hash 可用 memory_locate 定位原文。之后用 memory_search 的 tag 参数按标签查。",
+        "写入一条长期记忆。layer=relation（关键词-释义对，如称呼/爱好/旧账，每轮注入，常用的放这里）| user（用户档案：兴趣爱好、习惯、背景资料等，不常注入，需要时用 memory_search layer=user 查）| memo（便签：工作交接、临时草稿，可随时清空）| note（临时笔记）| saying（常言/口头禅的细节解释）| persona（人设设定）| diary（日记条目）。重要的事一定要写进来，否则下次会话不会记得。出处：source 记「谁说的/在哪看到的」（如「UP主@BV号」），quote 标原文（verbatim）还是转述（paraphrase）；找不到出处就留空，不编造。images/audios 可带本地图片或音频路径（音频支持 mp3/wav/m4a/aac/ogg/opus/flac/webm/amr），一起存进记忆资产库（适合人物设定、截图、示意图、语音片段），带 source 时会顺手登记资产出处。tags 可给条目打分类标签（除 persona 外都支持，更新时旧标签自动保留合并；写 -标签 表示删除该标签），只接受固定词表，词表外会被忽略。梗/口头禅/网络传说类请用 saying 层，关系层只放人和关系。diary 可加 important=true 标重要事件。note 可写备注（跟条目一起落盘并写进 guide 索引）；state 标记这条记忆的可信状态（做过 / 没做成 / 听说，配 proof 写依据），不标就是不标；计划/承诺类给 until（到期时间），到点会被到期提醒推一次；写入返回里的 hash 可用 memory_locate 定位原文。之后用 memory_search 的 tag 参数按标签查。",
       parameters: {
         type: "object",
         properties: {
@@ -6172,6 +6628,10 @@ function apply(ctx) {
           proof: {
             type: "string",
             description: "可选：状态依据——done 给回执（工具/链接/文件），failed 给失败原因，heard 给谁说的",
+          },
+          until: {
+            type: "string",
+            description: "可选：到期时间（YYYY-MM-DD 含当天，或带时区的 ISO）。写「欠着的事/计划/承诺」时用它；过了这个时间这条会算「已结束：到期」，并被到期提醒推一次（config.due.enabled 默认关）。不传就不写这个字段",
           },
           cue: {
             type: "object",
@@ -6341,6 +6801,83 @@ function apply(ctx) {
           return `规则册（共 ${rows.length} 条，生效 ${active} 条）\n${res.rows.map(formatRuleRow).join("\n")}${more}`;
         } catch (err) {
           return `读规则册失败：${err?.message || err}`;
+        }
+      },
+    });
+
+    // v0.39（B-94）：取词器 / 提词器的干预面。只动 deep/ 下那三张表，不碰记忆本体。
+    register({
+
+      name: "memory_cue",
+      description:
+        "取词器/提词器的干预面（B-94）：action=list 看「重要」库；events 看最近的回忆事件（成败都记）；misrecall 看记错表（取词时会被跳过、30 天过期）；forget 从记错表删一条（给 keyword 或 hash）；promote/demote 手动改某条重要的状态；stats 看汇总。它只读写 deep/important.jsonl、deep/recall-events.jsonl、deep/misrecall.jsonl，不新增/删除任何记忆条目。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "events", "misrecall", "forget", "promote", "demote", "stats"], description: "默认 list" },
+          keyword: { type: "string", description: "action=list/misrecall 时按主题词筛选；forget/promote/demote 时用来定位那一条（也可以直接给 hash）" },
+          hash: { type: "string", description: "forget/promote/demote 时按条目 hash 定位（可只给前 8 位）" },
+          limit: { type: "number", description: "最多几条，默认 20" },
+        },
+      },
+      output,
+      async execute(args) {
+        try {
+          const cp = cuePrompterFor();
+          const action = String(args?.action || "list");
+          const limit = Math.max(1, Math.min(100, Number(args?.limit) || 20));
+          const needle = String(args?.keyword || "").trim();
+          const hashNeedle = String(args?.hash || "").trim();
+          const match = (row) => {
+            const topic = String(row.topic || "");
+            if (needle && !topic.includes(needle) && !(row.refs || []).some((h) => String(h).includes(needle))) return false;
+            if (hashNeedle && !(row.refs || []).some((h) => String(h).startsWith(hashNeedle)) && String(row.hash || "").startsWith(hashNeedle)) return false;
+            return Boolean(needle || hashNeedle) || true;
+          };
+          if (action === "stats") {
+            const st = cp.stats();
+            const enabled = loadConfig().cueprompt?.enabled ? "开" : "关";
+            return `取词器/提词器：开关 ${enabled}｜重要 ${st.important} 条（生效 ${st.active}）｜回忆事件 ${st.events} 条（${st.eventMonths || 0} 个月）｜记错 ${st.misrecall} 条`;
+          }
+          if (action === "events") {
+            const rows = cp.readEvents(limit).reverse();
+            if (!rows.length) return "还没有回忆事件。";
+            return [
+              `最近 ${rows.length} 次回忆（旧→新倒序）：`,
+              ...rows.map((r) => `· ${String(r.ts || "").slice(5, 16)} ${r.verdict === "confirmed" ? "成功" : r.verdict === "denied" ? "失败" : "沉默"}${r.importantId ? `｜${r.importantId}` : ""}${r.hash ? `｜#${String(r.hash).slice(0, 8)}` : ""}`),
+            ].join("\n");
+          }
+          if (action === "misrecall") {
+            const rows = readJsonl(cp.paths.misrecall).filter((r) => !needle || String(r.topic || "").includes(needle) || String(r.hash || "").includes(needle)).slice(-limit);
+            if (!rows.length) return "记错表是空的（或没有匹配的）。";
+            return [`记错表 ${rows.length} 条（取词时会跳过，到期自动失效）：`, ...rows.map((r) => `· #${String(r.hash || "").slice(0, 8)}｜${r.topic || "(无主题)"}｜失败 ${r.fails || 1} 次｜到期 ${String(r.expiresAt || "").slice(0, 10)}`)].join("\n");
+          }
+          if (action === "forget") {
+            if (!needle && !hashNeedle) return "action=forget 需要 keyword 或 hash，别整表删。";
+            const rows = readJsonl(cp.paths.misrecall);
+            const keep = rows.filter((r) => !match(r));
+            const removed = rows.length - keep.length;
+            if (!removed) return "记错表里没找到匹配的那条。";
+            writeJsonl(cp.paths.misrecall, keep);
+            return `已从记错表移除 ${removed} 条（取词时不再跳过它们）。`;
+          }
+          if (action === "promote" || action === "demote") {
+            if (!needle && !hashNeedle) return `action=${action} 需要 keyword 或 hash。`;
+            const rows = readJsonl(cp.paths.important);
+            const hits = rows.filter((r) => match(r));
+            if (!hits.length) return "重要库里没找到匹配的那条。";
+            for (const r of hits) r.state = action === "promote" ? "active" : "demoted";
+            writeJsonl(cp.paths.important, rows);
+            return `${action === "promote" ? "已恢复" : "已降级"} ${hits.length} 条：${hits.map((r) => r.topic || r.id).join("、")}`;
+          }
+          const rows = cp.importantAll().filter((r) => match(r)).slice(-limit).reverse();
+          if (!rows.length) return "重要库还是空的（还没被确认过的回忆）。";
+          return [
+            `重要库 ${cp.importantAll().length} 条（显示最近 ${rows.length} 条）：`,
+            ...rows.map((r) => `· ${r.topic || "(无主题)"}｜成功 ${r.count || 0} 次 / 失败 ${r.fails || 0} 次｜${r.state || "active"}｜${String(r.lastAt || "").slice(0, 10)}`),
+          ].join("\n");
+        } catch (err) {
+          return `取词器/提词器操作失败：${err?.message || err}`;
         }
       },
     });
@@ -6839,13 +7376,15 @@ function apply(ctx) {
 
       name: "memory_recall",
       description:
-        "读取已归档的会话原文：session 传会话 id（可带 session- 前缀）；session=list 列出最近会话；query 过滤关键词；limit 默认 30（取最近 N 条）。返回「[用户]/[我] 文本」片段。用于「上一次会话干到哪了」这类跨会话交接。",
+        "读取已归档的会话原文：session 传会话 id（可带 session- 前缀）；session=list 列出最近会话；query 过滤关键词；limit 默认 30（取最近 N 条）；给了 seqFrom/seqTo 就按门牌只取那一段。返回「[用户][#seq]/[我][#seq] 文本」片段。用于「上一次会话干到哪了」这类跨会话交接，以及按 memory_locate 给的门牌跳回原话。",
       parameters: {
         type: "object",
         properties: {
           session: { type: "string", description: "会话 id，或 list 列出最近会话" },
           query: { type: "string", description: "只看包含该关键词的消息，可留空" },
           limit: { type: "number", description: "最多返回多少条，默认 30" },
+          seqFrom: { type: "number", description: "v0.39 门牌：只取事件序号 ≥ 这个值的原文（配合 memory_locate 里给出的门牌用）" },
+          seqTo: { type: "number", description: "v0.39 门牌：只取事件序号 ≤ 这个值的原文" },
         },
         required: ["session"],
       },
@@ -7082,6 +7621,6 @@ const plugin = {
   apply,
 };
 
-export { apply, loadState, saveState, STATE_PATH, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
+export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
 export default plugin;
 

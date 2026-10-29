@@ -72,7 +72,7 @@ try {
 
   ok("apply 不抛异常", applyErr === "", applyErr);
   ok("没有被宿主契约拒收的工具", rejected.length === 0, rejected.map((r) => `${r.name}: ${r.why}`).join("；"));
-  ok("注册数量 = 26", tools.length === 26, `实际 ${tools.length}`);
+  ok("注册数量 = 27（0.39 加了 memory_cue）", tools.length === 27, `实际 ${tools.length}`);
 
   const names = tools.map((t) => t.name);
   for (const want of ["memory_rules", "memory_search", "memory_write", "memory_handoff", "memory_archive_session"]) {

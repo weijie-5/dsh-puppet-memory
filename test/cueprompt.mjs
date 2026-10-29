@@ -1,0 +1,157 @@
+// v0.39（B-94）：取词器 + 提词器——取词优先/记错跳过/计分升格/沉默不加分
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createCuePrompter, bigramsOf, stripInjected, verdictOf } from "../cueprompt.js";
+
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-cueprompt-"));
+fs.mkdirSync(path.join(TMP, "deep"), { recursive: true });
+const J = (o) => JSON.stringify(o);
+
+let pass = 0;
+const fails = [];
+function ok(name, cond, extra = "") {
+  if (cond) pass += 1;
+  else fails.push(name + (extra ? `（${extra}）` : ""));
+}
+
+const writeJsonl = (rel, rows) => fs.writeFileSync(path.join(TMP, rel), rows.map(J).join("\n") + (rows.length ? "\n" : ""), "utf8");
+const readJsonl = (rel) => {
+  const p = path.join(TMP, rel);
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+};
+
+try {
+  const cp = createCuePrompter({ memDir: TMP });
+
+  // ---- 1. 二字词/判定词
+  const grams = bigramsOf("记忆注入确实是硬伤，2026-10-29 0.37");
+  ok("二字词只取中文两字", grams.includes("记忆") && grams.includes("硬伤"));
+  ok("数字不算标签", !grams.some((g) => /\d/.test(g)), grams.join(","));
+  ok("否认（没这回事）识别", verdictOf("没这回事，你瞎编") === "denied");
+  ok("反对（说法不对）识别", verdictOf("不是这个") === "objected");
+  ok("记错也算否认", verdictOf("你记错了") === "denied");
+  ok("确认识别", verdictOf("对，就是那次") === "confirmed");
+  ok("沉默不加分", verdictOf("那接下来做什么") === "silent");
+  // 2026-10-29 实机踩到的两个误判（diag.log 有回执），回归守住：
+  ok("他自己认错不算否认我", verdictOf("那是我记错了") === "silent");
+  ok("人也有记错的时候不算否认", verdictOf("可以否认或者反对，人也有记错的时候") === "objected");
+  ok("单说记错看不出主语→回原文", verdictOf("记错") === "objected");
+  ok("「我没记错」当反对，回原文核对（不直接罚）", verdictOf("我没记错") === "objected");
+  ok("注入块不进判读", verdictOf("<system-reminder>技能目录变了</system-reminder>那是我记错了") === "silent");
+  ok("剥注入块只留他的话", stripInjected("<system-reminder>a</system-reminder>\n<puppet_cue>x</puppet_cue>他在吗") === "他在吗");
+
+  // ---- 2. 重要库优先 + 常规补充
+  writeJsonl("deep/important.jsonl", [
+    { id: "imp-a", topic: "邮件被批两次", refs: ["h-mail"], evidence: "10-21 他说邮件被批了两次", count: 2, fails: 0, state: "active" },
+    { id: "imp-b", topic: "完全不相关的事", refs: ["h-other"], evidence: "别的事", count: 2, fails: 0, state: "active" },
+  ]);
+  const searchFn = (u, n) => [
+    { hash: "h-note1", text: "[behavior/notes.jsonl] 记忆注入是硬伤", where: "behavior/notes.jsonl" },
+    { hash: "h-mail", text: "[behavior/diary] 邮件那次", where: "behavior/diary" },
+  ].slice(0, n);
+  const picked = cp.pickCandidates({ userText: "邮件那件事后来怎么样了", searchFn, limit: 5 });
+  ok("重要库优先命中", picked.candidates[0]?.kind === "important" && picked.candidates[0]?.importantId === "imp-a", JSON.stringify(picked.candidates[0]));
+  ok("无关重要记忆不被取出", !picked.candidates.some((c) => c.importantId === "imp-b"));
+  ok("常规库补充进来", picked.candidates.some((c) => c.kind === "normal"));
+  ok("同一 hash 不重复", new Set(picked.candidates.map((c) => c.hash)).size === picked.candidates.length);
+
+  // ---- 3. 记错表跳过
+  writeJsonl("deep/misrecall.jsonl", [
+    { hash: "h-note1", topic: "", fails: 1, lastAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString() },
+  ]);
+  const picked2 = cp.pickCandidates({ userText: "记忆注入是硬伤", searchFn, limit: 5 });
+  ok("记错表里的条目被跳过", !picked2.candidates.some((c) => c.hash === "h-note1"));
+  ok("跳过被计数", picked2.blocked >= 1, String(picked2.blocked));
+  // 过期后又能取
+  writeJsonl("deep/misrecall.jsonl", [
+    { hash: "h-note1", topic: "", fails: 1, lastAt: new Date().toISOString(), expiresAt: new Date(Date.now() - 1000).toISOString() },
+  ]);
+  const picked3 = cp.pickCandidates({ userText: "记忆注入是硬伤", searchFn, limit: 5 });
+  ok("过期后允许再试", picked3.candidates.some((c) => c.hash === "h-note1"));
+
+  // ---- 4. 常规空 → 重要兜底
+  const noHits = () => [];
+  writeJsonl("deep/misrecall.jsonl", []);
+  const picked4 = cp.pickCandidates({ userText: "随便一句话完全不相干", searchFn: noHits, limit: 5 });
+  ok("常规 0 结果时回扫重要库", picked4.candidates.length > 0 && picked4.candidates.every((c) => c.kind === "important"), JSON.stringify(picked4.candidates.map((c) => c.kind)));
+
+  // ---- 5. 提词器判定
+  const cand = picked.candidates;
+  const good = await cp.judge({ userText: "邮件那件事", candidates: cand, callModel: async () => '{"pick":1,"hint":"他提过邮件被批两次","question":""}' });
+  ok("判定命中", good.pick && good.hint.includes("邮件"));
+  const none = await cp.judge({ userText: "邮件那件事", candidates: cand, callModel: async () => '{"pick":0,"hint":"","question":""}' });
+  ok("判定不构成回忆 → 不给提示", none.pick === null && none.hint === "");
+  const broken = await cp.judge({ userText: "x", candidates: cand, callModel: async () => "我觉得是吧" });
+  ok("模型输出非 JSON → 报错不崩", broken.pick === null && Boolean(broken.error));
+  const ask = await cp.judge({ userText: "x", candidates: cand, callModel: async () => '{"pick":2,"hint":"嗯","question":"你说的上周那次还是更早？"}' });  const lowConf = await cp.judge({ userText: "x", candidates: cand, callModel: async () => '{"pick":1,"confidence":0.3,"hint":"好像是这个","question":""}' });
+  ok("置信度 <0.5 → 不提（宁可不提也别糊弄）", lowConf.pick === null && lowConf.dismissed === true, JSON.stringify(lowConf));
+  const midConf = await cp.judge({ userText: "x", candidates: cand, callModel: async () => '{"pick":1,"confidence":0.6,"hint":"他提过邮件","question":""}' });
+  ok("置信度 0.5–0.7 → 带「不太确定」", midConf.pick && midConf.hint.startsWith("（我不太确定）"), midConf.hint);
+  const highConf = await cp.judge({ userText: "x", candidates: cand, callModel: async () => '{"pick":1,"confidence":0.9,"hint":"他提过邮件","question":""}' });
+  ok("置信度 >0.7 → 正常说", highConf.pick && !highConf.hint.startsWith("（我不太确定）"), highConf.hint);
+  ok("置信度回传", Number(highConf.confidence) === 0.9, String(highConf.confidence));
+
+  ok("多义时带提问句", ask.question.includes("上周"));
+
+  // ---- 6. 计分：第一次确认建档，第二次升「重要」，沉默不动
+  const first = cp.applyVerdict({ hash: "h-fresh", topic: "新的一件被确认的事", evidence: "第一次确认", verdict: "confirmed", session: "s1" });
+  ok("第一次确认：建档 count=1", first && Number(first.count) === 1, JSON.stringify(first));
+  const silent = cp.applyVerdict({ hash: "h-fresh", topic: "新的一件被确认的事", verdict: "silent" });
+  ok("沉默不加分", Number(silent.count) === 1, String(silent?.count));
+  const second = cp.applyVerdict({ hash: "h-fresh", topic: "新的一件被确认的事", verdict: "confirmed", session: "s2" });
+  ok("两次来回 → active + count=2", Number(second.count) === 2 && second.state === "active", JSON.stringify({ c: second?.count, s: second?.state }));
+  ok("两次会话都记下来", Array.isArray(second.sessions) && second.sessions.length === 2, JSON.stringify(second.sessions));
+
+  // ---- 7. 否认 → fails + 记错表
+  const denied = cp.applyVerdict({ hash: "h-fresh", topic: "新的一件被确认的事", verdict: "denied" });
+  ok("否认 → fails+1", Number(denied.fails) === 1, String(denied?.fails));
+  const mis = readJsonl("deep/misrecall.jsonl");
+  ok("否认写进记错表", mis.some((r) => r.hash === "h-fresh"));
+  const denied2 = cp.applyVerdict({ hash: "h-fresh", topic: "新的一件被确认的事", verdict: "denied" });
+  ok("两次否认 → demoted", denied2.state === "demoted", String(denied2?.state));
+
+  // ---- 8. 事件落盘 + 统计
+  cp.recordEvent({ session: "s1", candidates: cand, pick: good.pick, verdict: "confirmed", replyFingerprint: "abc123" });
+  const events = cp.readEvents(20);
+  ok("回忆事件写了一条", events.length === 1 && events[0].verdict === "confirmed", JSON.stringify(events[0]));
+  ok("事件带指纹（能把反驳对上条目）", events[0].myTextFingerprint === "abc123");
+  // 按月分片 + 月索引
+  const months = fs.readdirSync(path.join(TMP, "deep", "recall-events")).filter((f) => /^\d{4}-\d{2}\.jsonl$/.test(f));
+  ok("事件按月份片落盘", months.length === 1, months.join(","));
+  const mindex = readJsonl("deep/recall-events/index.jsonl");
+  ok("月索引有一行", mindex.length === 1 && mindex[0].count === 1, JSON.stringify(mindex));
+  ok("月索引记了成败计数", Number(mindex[0].confirmed) === 1, JSON.stringify(mindex[0]));
+  const st = cp.stats();
+  ok("统计能报数（含月份数）", st.important >= 1 && st.events === 1 && st.misrecall >= 1 && st.eventMonths === 1, JSON.stringify(st));
+  // 旧单文件仍能读（兼容）
+  fs.appendFileSync(path.join(TMP, "deep", "recall-events.jsonl"), J({ ts: "2026-09-30T00:00:00.000Z", verdict: "denied", session: "old" }) + String.fromCharCode(10), "utf8");
+  const withLegacy = cp.readEvents(20);
+  ok("兼容旧单文件事件", withLegacy.some((e) => e.session === "old"), JSON.stringify(withLegacy.map((e) => e.session)));
+
+  // ---- 8b. 待判回忆落盘：重启（换实例）后还在
+  cp.savePending("sess-a", { hash: "h-x", importantId: "", candidates: [{ hash: "h-x" }] });
+  ok("待判回忆落盘", fs.existsSync(path.join(TMP, "state", "cue-pending.json")));
+  const cp2 = createCuePrompter({ memDir: TMP }); // 新实例＝模拟重启
+  ok("重启后仍能读到待判回忆", cp2.loadPending("sess-a")?.hash === "h-x", JSON.stringify(cp2.loadPending("sess-a")));
+  cp2.clearPending("sess-a");
+  ok("清除后不再残留", cp.loadPending("sess-a") === null);
+  // 过期（>24h）自动不算
+  fs.writeFileSync(path.join(TMP, "state", "cue-pending.json"), J({ "sess-old": { hash: "h-y", at: Date.now() - 25 * 3600 * 1000 } }), "utf8");
+  ok("过期待判不再算数", cp.loadPending("sess-old") === null);
+
+  // ---- 9. 坏数据不崩
+  fs.writeFileSync(path.join(TMP, "deep", "important.jsonl"), "这不是 json\n{坏行\n", "utf8");
+  const afterBad = cp.pickCandidates({ userText: "邮件", searchFn: noHits, limit: 3 });
+  ok("重要库坏行不影响取词", Array.isArray(afterBad.candidates));
+} finally {
+  fs.rmSync(TMP, { recursive: true, force: true });
+}
+
+if (fails.length) {
+  console.log(`❌ cueprompt：${pass} 过，${fails.length} 失败`);
+  for (const f of fails) console.log(`   - ${f}`);
+  process.exit(1);
+}
+console.log(`✅ cueprompt：${pass} 项全过`);

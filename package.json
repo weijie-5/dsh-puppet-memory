@@ -11,6 +11,9 @@
   },
   "files": [
     "index.js",
+    "rules.js",
+    "searchindex.js",
+    "cueprompt.js",
     "client.js",
     "social.js",
     "state.js",
