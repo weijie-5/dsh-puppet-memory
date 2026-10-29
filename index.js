@@ -6355,9 +6355,14 @@ function apply(ctx) {
           // 提词器只看「上一段 + 这一段」（更早的作废），用来判这条算不算回忆、以及你上句是确认还是否认。
           if (cfg.cueprompt?.enabled) {
             const NL = String.fromCharCode(10);
-            const texts = recentUserTexts(decision.messages || []).map((t) => stripInjected(t));
+            // 剥掉注入块后可能只剩空串（宿主把 <puppet_*> 也记成 user/message，还不一定带 source），
+            // 所以多取几条、只留剥完仍有内容的：第 0 条是这一段，第 1 条是上一段。
+            const texts = recentUserTexts(decision.messages || [], 4)
+              .map((t) => stripInjected(t))
+              .filter((t) => t.trim());
             const userText = texts[0] || "";
             const prevText = texts[1] || "";
+            if (!texts.length) diag("取词跳过：这一轮没扫到可用的用户发言（只剩注入块）");
             const cp = cuePrompterFor();
             const pending = cp.loadPending(sessionId);
             let actedThisTurn = false; // 这回合判过成败/摆过原文 → 不再抛新回忆（但待判本身不挡取词）

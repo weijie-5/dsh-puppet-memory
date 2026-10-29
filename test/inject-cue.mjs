@@ -142,6 +142,20 @@ try {
     JSON.stringify(pendDoc["cue-s1"] || {}),
   );
 
+  // ---- 注入块当尾巴（宿主把 <puppet_*> 也记成 user/message，且可能没带 source）
+  const agent5 = { session: { header: { id: "cue-s5", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
+  const run5 = async (msgs) => {
+    const decision = await preStep({ agent: agent5 }, async () => ({ kind: "enter", messages: msgs }));
+    return (decision?.messages || [])
+      .map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || "")))
+      .join(String.fromCharCode(10));
+  };
+  const t5 = await run5([
+    { role: "user", content: [{ type: "text", text: "邮件那件事你还记得吗" }] },
+    { role: "user", content: [{ type: "text", text: "<puppet_handoff>交接纸条</puppet_handoff>" }] },
+  ]);
+  ok("注入块当尾巴时仍能取词（剥完只留真发言）", t5.includes("<puppet_cue>"), t5.slice(0, 100));
+
   // ---- 新规矩（2026-10-29）：待判不挡取词；上一段没表态就作废（独立会话 cue-s4 验）
   const agent4 = { session: { header: { id: "cue-s4", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
   const run4 = async (userText) => {
