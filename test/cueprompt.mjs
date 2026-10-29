@@ -130,6 +130,17 @@ try {
   const withLegacy = cp.readEvents(20);
   ok("兼容旧单文件事件", withLegacy.some((e) => e.session === "old"), JSON.stringify(withLegacy.map((e) => e.session)));
 
+  // ---- 8a. 事件里的总结（丹阳 2026-10-29：「是加的事件里进行总结」——不升成规则）
+  cp.recordEvent({ session: "s2", pick: { hash: "h-topic", topic: "反数值设计" }, candidates: [], verdict: "objected", summary: "他反对用数值当目标：会作弊、越权、失去现在" });
+  cp.recordEvent({ session: "s2", pick: { hash: "h-topic", topic: "反数值设计" }, candidates: [], verdict: "confirmed", summary: "他确认这条说法就是那个意思" });
+  const afterSum = cp.readEvents(20).filter((e) => e.topic === "反数值设计");
+  ok("事件带一句总结", afterSum.length === 2 && afterSum.every((e) => e.summary), JSON.stringify(afterSum[0]));
+  const groups8 = cp.groupEvents(cp.readEvents(20));
+  const grp = groups8.find((g) => g.key === "反数值设计");
+  ok("同话题归并成一组", grp && grp.count === 2, JSON.stringify(grp));
+  ok("归并组带统计与最后一句总结", grp && grp.confirmed === 1 && grp.objected === 1 && grp.summary.includes("确认"), JSON.stringify(grp));
+  ok("归并组按最近时间排在前面", groups8[0]?.key === "反数值设计", JSON.stringify(groups8.map((g) => g.key)));
+
   // ---- 8b. 待判回忆落盘：重启（换实例）后还在
   cp.savePending("sess-a", { hash: "h-x", importantId: "", candidates: [{ hash: "h-x" }] });
   ok("待判回忆落盘", fs.existsSync(path.join(TMP, "state", "cue-pending.json")));

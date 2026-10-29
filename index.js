@@ -6323,7 +6323,7 @@ function apply(ctx) {
               const verdict = verdictOf(userText);
               if (verdict !== "silent") {
                 cp.applyVerdict({ hash: pending.hash, importantId: pending.importantId || "", topic: pending.topic || "", verdict, session: sessionId });
-                cp.recordEvent({ session: sessionId, pick: pending, candidates: pending.candidates || [], verdict });
+                cp.recordEvent({ session: sessionId, pick: pending, candidates: pending.candidates || [], verdict, summary: pending.summary || pending.hint || "", topic: pending.topic || "" });
                 diag(`回忆判定：${verdict}（#${String(pending.hash || "").slice(0, 8)}）`);
                 // ③④ 闭环：被反对 → 立刻回原文核对，本轮就把原话摆出来再回答
                 if (verdict === "objected") {
@@ -6842,9 +6842,23 @@ function apply(ctx) {
           if (action === "events") {
             const rows = cp.readEvents(limit).reverse();
             if (!rows.length) return "还没有回忆事件。";
+            // 丹阳 2026-10-29：事件里要带总结——先按话题归并，再列明细
+            const groups = cp.groupEvents(rows).slice(0, limit);
+            const head = groups.map((g) => {
+              const stat = [];
+              if (g.confirmed) stat.push(`成功 ${g.confirmed}`);
+              if (g.denied) stat.push(`失败 ${g.denied}`);
+              if (g.objected) stat.push(`反对 ${g.objected}`);
+              if (g.silent) stat.push(`沉默 ${g.silent}`);
+              const summary = g.summary ? `\n    总结：${g.summary}` : "\n    总结：（还没写——下次命中时按当时的提词补一句）";
+              return `· ${g.topic || (g.hash ? `#${String(g.hash).slice(0, 8)}` : "(无主题)")}｜${g.count} 次（${stat.join(" / ")}）｜最近 ${String(g.lastAt || "").slice(5, 16)}${summary}`;
+            });
             return [
-              `最近 ${rows.length} 次回忆（旧→新倒序）：`,
-              ...rows.map((r) => `· ${String(r.ts || "").slice(5, 16)} ${r.verdict === "confirmed" ? "成功" : r.verdict === "denied" ? "失败" : "沉默"}${r.importantId ? `｜${r.importantId}` : ""}${r.hash ? `｜#${String(r.hash).slice(0, 8)}` : ""}`),
+              `按话题归并 ${groups.length} 组（共 ${rows.length} 次回忆）：`,
+              ...head,
+              "",
+              `明细（旧→新）：`,
+              ...rows.map((r) => `· ${String(r.ts || "").slice(5, 16)} ${r.verdict === "confirmed" ? "成功" : r.verdict === "denied" ? "失败" : r.verdict === "objected" ? "反对" : "沉默"}${r.hash ? `｜#${String(r.hash).slice(0, 8)}` : ""}${r.summary ? `｜${clip(r.summary, 40)}` : ""}`),
             ].join("\n");
           }
           if (action === "misrecall") {

@@ -316,14 +316,18 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
   }
 
   /** 记一次回忆事件（成败都记）：明细分月落盘，同时维护一行月索引 */
-  function recordEvent({ session = "", scene = "private", candidates = [], pick = null, verdict = "silent", replyFingerprint = "" } = {}) {
+  function recordEvent({ session = "", scene = "private", candidates = [], pick = null, verdict = "silent", replyFingerprint = "", summary = "", topic = "" } = {}) {
     const ts = now();
+    // 丹阳 2026-10-29：事件里要带一句**总结**（这条回忆到底讲的什么事），
+    // 同话题的多次事件靠 topic 归并；总结不是分数，只给人看，也不参与取词排序。
     const row = {
       ts: new Date(ts).toISOString(),
       session,
       scene,
       hash: pick?.hash || "",
       importantId: pick?.importantId || "",
+      topic: String(topic || pick?.topic || "").trim(),
+      summary: String(summary || pick?.hint || "").trim().slice(0, 200),
       candidates: candidates.map((c) => c.hash).slice(0, 8),
       myTextFingerprint: replyFingerprint,
       verdict,
@@ -372,6 +376,28 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       for (let i = legacy.length - 1; i >= 0 && out.length < max; i -= 1) out.push(legacy[i]);
     }
     return out;
+  }
+
+  /** 把事件按话题归并（同 topic 优先，没 topic 就按 hash）：次数 + 最近时间 + 最后一句总结 */
+  function groupEvents(rows = []) {
+    const map = new Map();
+    for (const r of rows) {
+      const key = String(r.topic || "").trim() || String(r.hash || "").trim() || "(无主题)";
+      const hit = map.get(key) || { key, topic: r.topic || "", hash: r.hash || "", count: 0, confirmed: 0, denied: 0, objected: 0, silent: 0, lastAt: "", summary: "", samples: [] };
+      hit.count += 1;
+      const v = ["confirmed", "denied", "objected"].includes(r.verdict) ? r.verdict : "silent";
+      hit[v] += 1;
+      // 行是「新→旧」，只有严格更近的才更新总结，否则同毫秒的旧行会把新总结盖掉
+      const ts = String(r.ts || "");
+      if (!hit.lastAt || ts > hit.lastAt) {
+        hit.lastAt = ts;
+        if (r.summary) hit.summary = r.summary;
+      }
+      if (r.summary && hit.samples.length < 3 && !hit.samples.includes(r.summary)) hit.samples.push(r.summary);
+      if (!hit.hash && r.hash) hit.hash = r.hash;
+      map.set(key, hit);
+    }
+    return [...map.values()].sort((a, b) => String(b.lastAt).localeCompare(String(a.lastAt)));
   }
 
   /** 计分：确认 +1、否认 +1 fails、沉默不记；两次确认升重要 */
@@ -464,5 +490,5 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     };
   }
 
-  return { paths, pendingPath, pickCandidates, judge, recordEvent, readEvents, applyVerdict, misrecallSet, verdictOf, stats, importantAll, savePending, loadPending, clearPending };
+  return { paths, pendingPath, pickCandidates, judge, recordEvent, readEvents, groupEvents, applyVerdict, misrecallSet, verdictOf, stats, importantAll, savePending, loadPending, clearPending };
 }
