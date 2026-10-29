@@ -390,6 +390,9 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     // 丹阳 2026-10-29：事件里要带一句**总结**（这条回忆到底讲的什么事），
     // 同话题的多次事件靠 topic 归并；总结不是分数，只给人看，也不参与取词排序。
     const row = {
+      // 丹阳 2026-10-29：每次「提出一条回忆」就落一条事件（一开始 verdict=silent），
+      // 他表态后用 updateEvent 改同一条；这样「回忆了几次、几次没被用」才算得清，也不重复计数。
+      id: `ev-${ts}-${Math.random().toString(36).slice(2, 6)}`,
       ts: new Date(ts).toISOString(),
       session,
       scene,
@@ -407,25 +410,60 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     const month = monthKeyOf(ts);
     const file = path.join(paths.eventsDir, `${month}.jsonl`);
     appendJsonl(file, row);
-    // 月索引：一行一个月，只存指针与计数（不存内容）
+    bumpMonthIndex(ts, verdict, 1, String(pick?.topic || row.topic || "").trim(), row.ts);
+    return row;
+  }
+
+  /** 月索引计数：delta=+1 记一条，-1 用来撤销旧判定 */
+  function bumpMonthIndex(ts, verdict, delta, topic = "", at = "") {
+    const month = monthKeyOf(ts);
     try {
       const idx = readJsonl(paths.eventsIndex);
       let hit = idx.find((r) => r.month === month);
       if (!hit) {
-        hit = { month, file: `${month}.jsonl`, count: 0, confirmed: 0, denied: 0, objected: 0, silent: 0, firstAt: row.ts, topics: [] };
+        hit = { month, file: `${month}.jsonl`, count: 0, confirmed: 0, denied: 0, objected: 0, silent: 0, firstAt: at, topics: [] };
         idx.push(hit);
       }
-      hit.count = Number(hit.count || 0) + 1;
-      const key = verdict === "confirmed" || verdict === "denied" || verdict === "objected" ? verdict : "silent";
-      hit[key] = Number(hit[key] || 0) + 1;
-      hit.lastAt = row.ts;
-      const topic = String(pick?.topic || "").trim();
-      if (topic && !(hit.topics || []).includes(topic)) hit.topics = [...(hit.topics || []), topic].slice(-8);
+      hit.count = Math.max(0, Number(hit.count || 0) + delta);
+      const key = ["confirmed", "denied", "objected"].includes(verdict) ? verdict : "silent";
+      hit[key] = Math.max(0, Number(hit[key] || 0) + delta);
+      if (at) hit.lastAt = at;
+      if (delta > 0 && topic && !(hit.topics || []).includes(topic)) hit.topics = [...(hit.topics || []), topic].slice(-8);
       rewriteJsonl(paths.eventsIndex, idx.slice(-60));
     } catch {
       /* 索引写不进不影响明细 */
     }
-    return row;
+  }
+
+  /** 改一条已落盘事件的判定（他要表态了）：找到 id → patch → 月索引同步挪计数 */
+  function updateEvent({ id, patch = {} } = {}) {
+    if (!id) return null;
+    let months = [];
+    try {
+      months = readJsonl(paths.eventsIndex)
+        .map((r) => String(r.month || ""))
+        .filter(Boolean)
+        .sort()
+        .reverse();
+    } catch {
+      months = [];
+    }
+    for (const month of months) {
+      const file = path.join(paths.eventsDir, `${month}.jsonl`);
+      const rows = readJsonl(file);
+      const i = rows.findIndex((r) => r && r.id === id);
+      if (i < 0) continue;
+      const before = rows[i];
+      const after = { ...before, ...patch };
+      rows[i] = after;
+      rewriteJsonl(file, rows);
+      if (patch.verdict && patch.verdict !== before.verdict) {
+        bumpMonthIndex(Date.parse(after.ts) || now(), before.verdict || "silent", -1, "", "");
+        bumpMonthIndex(Date.parse(after.ts) || now(), patch.verdict, 1, "", "");
+      }
+      return after;
+    }
+    return null;
   }
 
   /** 读最近的回忆事件（新→旧）：先看月索引挑月份，再读明细；旧的单文件当成最早的月份 */
@@ -565,5 +603,5 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     };
   }
 
-  return { paths, pendingPath, pickCandidates, judge, recordEvent, readEvents, groupEvents, applyVerdict, misrecallSet, verdictOf, stats, importantAll, savePending, loadPending, clearPending };
+  return { paths, pendingPath, pickCandidates, judge, recordEvent, readEvents, groupEvents, updateEvent, applyVerdict, misrecallSet, verdictOf, stats, importantAll, savePending, loadPending, clearPending };
 }

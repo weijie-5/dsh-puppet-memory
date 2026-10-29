@@ -6372,7 +6372,14 @@ function apply(ctx) {
               if (verdict !== "silent") {
                 // 事件候选不是记忆条目：只在事件表里再记一条，不升重要、不进记错表
                 if (!isEventCand) cp.applyVerdict({ hash: pending.hash, importantId: pending.importantId || "", topic: pending.topic || "", verdict, session: sessionId });
-                cp.recordEvent({ session: sessionId, pick: pending, candidates: pending.candidates || [], verdict, summary: pending.eventSummary || pending.summary || pending.hint || "", topic: pending.topic || "" });
+                // 事件在「提出这条回忆」时就已经落盘（verdict=silent），这里只把同一条改成最终判定
+                const patched = pending.eventId
+                  ? cp.updateEvent({ id: pending.eventId, patch: { verdict, summaryBy: verdict === "confirmed" ? "both" : "ai" } })
+                  : null;
+                if (!patched) {
+                  // 老 pending 没有事件 id（升级前留下的）：补记一条，别丢这次的判定
+                  cp.recordEvent({ session: sessionId, pick: pending, candidates: pending.candidates || [], verdict, summary: pending.eventSummary || pending.summary || pending.hint || "", topic: pending.topic || "" });
+                }
                 diag(`回忆判定：${verdict}（#${String(pending.hash || "").slice(0, 8)}）`);
                 // ③④ 闭环：被反对 → 立刻回原文核对，本轮就把原话摆出来再回答
                 if (verdict === "objected") {
@@ -6430,10 +6437,21 @@ function apply(ctx) {
                   // 事件候选：topic 用事件键，判定时新事件能并回同一组；总结沿用事件原来的那句
                   const isEv = judged.pick?.kind === "event";
                   const evSummary = isEv ? String(judged.pick.text || "").split("｜").slice(1).join("｜").trim() : "";
+                  // 每次提出一条回忆就落一条事件（先记 silent）；他表态后用 updateEvent 改同一条
+                  const evRow = cp.recordEvent({
+                    session: sessionId,
+                    pick: judged.pick,
+                    candidates: picked.candidates,
+                    verdict: "silent",
+                    summary: evSummary || judged.hint || "",
+                    topic: isEv ? String(judged.pick.eventKey || "") : "",
+                  });
+                  diag(`回忆事件：${evRow.id}（待他表态）`);
                   cp.savePending(sessionId, {
                     ...judged.pick,
                     topic: isEv ? String(judged.pick.eventKey || "") : "",
                     eventSummary: evSummary,
+                    eventId: evRow.id,
                     candidates: picked.candidates,
                     prevUserText: prevText,
                   });

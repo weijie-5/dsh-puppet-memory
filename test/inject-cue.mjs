@@ -111,6 +111,13 @@ try {
 
   ok("cue 后待判回忆已落盘", fs.existsSync(path.join(TMP, "state", "cue-pending.json")), "state/cue-pending.json 不存在");
 
+  // ---- 沉默也记事件：提出时就落一条（silent），表态后改同一条，不翻倍
+  const evDir0 = path.join(TMP, "deep", "recall-events");
+  const evRows0 = fs.existsSync(evDir0)
+    ? fs.readdirSync(evDir0).filter((f) => /^\d{4}-\d{2}\.jsonl$/.test(f)).flatMap((f) => readJsonl(path.join("deep", "recall-events", f)))
+    : [];
+  ok("提出回忆时就记了事件（还没表态，verdict=silent）", evRows0.some((e) => e.verdict === "silent" && e.id), JSON.stringify(evRows0.map((e) => e.verdict)));
+
   // ---- 第二回合：你说「对」→ 计成功 + 写事件
   const confirm = await run("对，就是那次");
   const eventFiles = fs.existsSync(path.join(TMP, "deep", "recall-events"))
@@ -119,6 +126,7 @@ try {
   const confirmedRows = eventFiles.flatMap((f) => readJsonl(path.join("deep", "recall-events", f)));
   ok("确认后写了回忆事件（按月分片）", confirmedRows.length >= 1, JSON.stringify(confirmedRows[0] || {}));
   ok("事件记的是成功", confirmedRows.some((e) => e.verdict === "confirmed"), JSON.stringify(confirmedRows.map((e) => e.verdict)));
+  ok("肯定后是同一条事件变成成功（没有多记一行）", confirmedRows.filter((e) => e.verdict === "confirmed").length === 1 && confirmedRows.filter((e) => e.verdict === "silent").length === 0, JSON.stringify(confirmedRows.map((e) => e.verdict)));
   const imps = readJsonl("deep/important.jsonl");
   ok("成功次数 +1", Number(imps[0]?.count) === 2, JSON.stringify({ count: imps[0]?.count }));
   void confirm;

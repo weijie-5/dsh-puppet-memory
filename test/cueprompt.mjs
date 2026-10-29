@@ -151,6 +151,17 @@ try {
   const withLegacy = cp.readEvents(20);
   ok("兼容旧单文件事件", withLegacy.some((e) => e.session === "old"), JSON.stringify(withLegacy.map((e) => e.session)));
 
+  // ---- 7b. 沉默也记事件（丹阳 2026-10-29）：提出即落一条 silent，表态后改同一条
+  const ev1 = cp.recordEvent({ session: "s6", pick: { hash: "h-silent", topic: "沉默测试" }, candidates: [], verdict: "silent", summary: "这条只提出、没表态" });
+  ok("事件带 id（表态时对得上）", String(ev1.id || "").startsWith("ev-"), JSON.stringify(ev1.id));
+  ok("提出即记一条 silent 事件", ev1.verdict === "silent", JSON.stringify(ev1.verdict));
+  const upd = cp.updateEvent({ id: ev1.id, patch: { verdict: "confirmed", summaryBy: "both" } });
+  ok("表态后改同一条事件", Boolean(upd) && upd.verdict === "confirmed" && upd.summaryBy === "both", JSON.stringify(upd?.verdict));
+  const sameRow = cp.readEvents(60).filter((e) => e.id === ev1.id);
+  ok("改的是同一条，没有多记一行", sameRow.length === 1 && sameRow[0].verdict === "confirmed", String(sameRow.length));
+  const g6 = cp.groupEvents(cp.readEvents(60)).find((x) => x.key === "沉默测试");
+  ok("归并组按最终判定计数", Boolean(g6) && g6.confirmed === 1 && (g6.silent || 0) === 0, JSON.stringify(g6));
+
   // ---- 8a. 事件里的总结（丹阳 2026-10-29：「是加的事件里进行总结」——不升成规则）
   cp.recordEvent({ session: "s2", pick: { hash: "h-topic", topic: "反数值设计" }, candidates: [], verdict: "objected", summary: "他反对用数值当目标：会作弊、越权、失去现在" });
   cp.recordEvent({ session: "s2", pick: { hash: "h-topic", topic: "反数值设计" }, candidates: [], verdict: "confirmed", summary: "他确认这条说法就是那个意思" });
