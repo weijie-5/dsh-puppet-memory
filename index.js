@@ -6368,7 +6368,19 @@ function apply(ctx) {
             const texts = recentUserTexts(decision.messages || [], 2);
             const userText = texts[0] || "";
             const prevText = texts[1] || "";
-            if (!texts.length) diag("取词跳过：这一轮没扫到可用的用户发言（只剩注入块）");
+            if (!texts.length) {
+              // 跳过也要留下现场：末尾几条消息长什么样（角色/长度/开头），否则下次还是猜
+              const arr = decision.messages || [];
+              const brief = arr.slice(-8).map((m) => {
+                const raw = typeof m?.content === "string"
+                  ? m.content
+                  : Array.isArray(m?.content)
+                    ? m.content.map((b) => (b && b.type === "text" ? b.text || "" : `[${b && b.type}]`)).join("")
+                    : "";
+                return `${m?.role || "?"}:${String(raw).length}:${String(raw).slice(0, 10).replace(/\s/g, " ")}`;
+              });
+              diag(`取词跳过：这一轮没扫到可用的用户发言（只剩注入块）｜${arr.length} 条｜末尾 ${brief.join(" / ")}`);
+            }
             const cp = cuePrompterFor();
             const pending = cp.loadPending(sessionId);
             let actedThisTurn = false; // 这回合判过成败/摆过原文 → 不再抛新回忆（但待判本身不挡取词）
