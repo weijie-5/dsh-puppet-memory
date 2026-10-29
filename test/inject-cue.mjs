@@ -164,6 +164,21 @@ try {
   ]);
   ok("注入块当尾巴时仍能取词（剥完只留真发言）", t5.includes("<puppet_cue>"), t5.slice(0, 100));
 
+  // A-98：注入块有好几层（core/rules/state/handoff/recall/cue…），不能只往回看 4 条
+  const manyInjections = [
+    { role: "user", content: [{ type: "text", text: "邮件那件事你还记得吗" }] },
+    { role: "user", content: [{ type: "text", text: "<puppet_rules>规则</puppet_rules>" }] },
+    { role: "user", content: [{ type: "text", text: "<puppet_core>核心</puppet_core>" }] },
+    { role: "user", content: [{ type: "text", text: "<puppet_state>状态</puppet_state>" }] },
+    { role: "user", content: [{ type: "text", text: "<puppet_handoff>交接</puppet_handoff>" }] },
+    { role: "user", content: [{ type: "text", text: "<puppet_recall>召回</puppet_recall>" }] },
+    { role: "user", content: [{ type: "text", text: "<puppet_memory>摘要</puppet_memory>" }] },
+  ];
+  const agent6 = { session: { header: { id: "cue-s6", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
+  const decision6 = await preStep({ agent: agent6 }, async () => ({ kind: "enter", messages: manyInjections }));
+  const t6 = (decision6?.messages || []).map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || ""))).join(String.fromCharCode(10));
+  ok("六层注入块压着也能找到他那句话", t6.includes("<puppet_cue>"), t6.slice(0, 100));
+
   // ---- 新规矩（2026-10-29）：待判不挡取词；上一段没表态就作废（独立会话 cue-s4 验）
   const agent4 = { session: { header: { id: "cue-s4", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
   const run4 = async (userText) => {

@@ -2813,20 +2813,28 @@ function verifyExcerptOf(hash) {
   }
 }
 
-/** 最近两段真实用户发言（[0]=这一段，[1]=上一段）；插件自己注入的不算 */
-function recentUserTexts(messages = [], n = 2) {
+/**
+ * 最近两段真实用户发言（[0]=这一段，[1]=上一段）。
+ * 注意（A-98）：宿主会在他的话后面追加**好几条**注入消息（core/rules/state/handoff/recall/cue…），
+ * 而且这些注入块不一定带 `source`。所以不能只往回看 4 条，也不能只靠 source 认；
+ * 一律剥掉注入块、剥完是空的就当没这条，最多往回扫 maxScan 条。
+ */
+function recentUserTexts(messages = [], n = 2, maxScan = 40) {
   const out = [];
   const list = Array.isArray(messages) ? messages : [];
-  for (let i = list.length - 1; i >= 0 && out.length < n; i -= 1) {
+  let scanned = 0;
+  for (let i = list.length - 1; i >= 0 && out.length < n && scanned < maxScan; i -= 1) {
+    scanned += 1;
     const m = list[i];
     if (!m || m.role !== "user") continue;
     const src = m.source || {};
     if (src.kind && String(src.kind).startsWith("plugin:")) continue;
-    const t = typeof m.content === "string"
+    const raw = typeof m.content === "string"
       ? m.content
       : Array.isArray(m.content)
         ? m.content.map((b) => (b && b.type === "text" ? b.text || "" : "")).join(String.fromCharCode(10))
         : "";
+    const t = stripInjected(raw);
     if (!String(t || "").trim()) continue;
     out.push(t);
   }
@@ -6357,9 +6365,7 @@ function apply(ctx) {
             const NL = String.fromCharCode(10);
             // 剥掉注入块后可能只剩空串（宿主把 <puppet_*> 也记成 user/message，还不一定带 source），
             // 所以多取几条、只留剥完仍有内容的：第 0 条是这一段，第 1 条是上一段。
-            const texts = recentUserTexts(decision.messages || [], 4)
-              .map((t) => stripInjected(t))
-              .filter((t) => t.trim());
+            const texts = recentUserTexts(decision.messages || [], 2);
             const userText = texts[0] || "";
             const prevText = texts[1] || "";
             if (!texts.length) diag("取词跳过：这一轮没扫到可用的用户发言（只剩注入块）");
