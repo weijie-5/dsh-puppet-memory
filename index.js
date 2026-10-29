@@ -662,7 +662,7 @@ function defaultConfig() {
     search: { engine: "scan" },
     // v0.39（B-94）：取词器 + 提词器。默认关——它每回合要调一次小模型判「这算不算回忆」。
     // 取词器只管取（重要库优先），提词器只管判 + 给一句自然语言提示，不贴资料块。
-    cueprompt: { enabled: false, maxCandidates: 7, maxHintChars: 140, model: null },
+    cueprompt: { enabled: false, maxCandidates: 7, maxHintChars: 140, model: null, mode: "assist" },
     // 多人记忆（v0.21 骨架）：默认关闭注入。关着时工具仍可显式读写 social/，但一个字都不注入。
     // 只有 enabled=true 且能从 session header 认出场景（群/私聊 + 对象）时，才按场景注入档案。
     social: socialConfigDefaults(),
@@ -6398,6 +6398,9 @@ function apply(ctx) {
             }
             const userText = texts[0] || "";
             const prevText = texts[1] || "";
+            // 三种运行模式（借用 dsh-memory-gate 的思路，2026-10-29 丹阳同意）：shadow 只审计不注入 /
+            // assist 照常注入（默认）/ enforce 只注入高置信（<0.7 只记事件、不进上下文）
+            const cueMode = String(cfg.cueprompt.mode || "assist");
             if (!texts.length) {
               // 跳过也要留下现场：末尾几条消息长什么样（角色/长度/开头），否则下次还是猜
               const arr = decision.messages || [];
@@ -6500,6 +6503,8 @@ function apply(ctx) {
                   // 事件候选：topic 用事件键，判定时新事件能并回同一组；总结沿用事件原来的那句
                   const isEv = judged.pick?.kind === "event";
                   const evSummary = isEv ? String(judged.pick.text || "").split("｜").slice(1).join("｜").trim() : "";
+                  const conf = Number(judged.confidence || 0);
+                  const canShow = cueMode !== "enforce" || conf >= 0.7;
                   // 每次提出一条回忆就落一条事件（先记 silent）；他表态后用 updateEvent 改同一条
                   const evRow = cp.recordEvent({
                     session: sessionId,
@@ -6511,21 +6516,30 @@ function apply(ctx) {
                     confidence: judged.confidence,
                     sources: { important: picked.fromImportant || 0, event: picked.fromEvent || 0, normal: picked.fromNormal || 0 },
                   });
-                  diag(`回忆事件：${evRow.id}（待他表态）`);
-                  cp.savePending(sessionId, {
-                    ...judged.pick,
-                    topic: isEv ? String(judged.pick.eventKey || "") : "",
-                    eventSummary: evSummary,
-                    eventId: evRow.id,
-                    candidates: picked.candidates,
-                    prevUserText: prevText,
-                  });
-                  const rows = ["（提示：这件事你和他之前聊过。若自然就用平常语气带出来，别罗列资料、别贴编号）", judged.hint];
-                  if (judged.question) rows.push(`（拿不准可以先问一句：${judged.question}）`);
-                  cueSeenSet(sessionId, { cueKey: textKey });
-                  cueText = ["<puppet_cue>", rows.join(NL), "</puppet_cue>"].join(NL);
+                  if (!canShow) {
+                    diag(`enforce：置信度 ${conf} < 0.7，不注入（事件 ${evRow.id} 仍记）`);
+                  } else {
+                    diag(`回忆事件：${evRow.id}（待他表态）`);
+                    cp.savePending(sessionId, {
+                      ...judged.pick,
+                      topic: isEv ? String(judged.pick.eventKey || "") : "",
+                      eventSummary: evSummary,
+                      eventId: evRow.id,
+                      candidates: picked.candidates,
+                      prevUserText: prevText,
+                    });
+                    const rows = ["（提示：这件事你和他之前聊过。若自然就用平常语气带出来，别罗列资料、别贴编号）", judged.hint];
+                    if (judged.question) rows.push(`（拿不准可以先问一句：${judged.question}）`);
+                    cueSeenSet(sessionId, { cueKey: textKey });
+                    cueText = ["<puppet_cue>", rows.join(NL), "</puppet_cue>"].join(NL);
+                  }
                 }
               }
+            }
+            // shadow（观察态）：该做的都做了、事件也记了，只是不往上下文里塞——借自 dsh-memory-gate
+            if (cueMode === "shadow" && cueText) {
+              diag(`shadow：本应注入${cueText.includes("<puppet_verify>") ? "核对原文" : "回忆提示"}，按观察态不注入`);
+              cueText = "";
             }
           }
         } catch (err) {
@@ -6987,9 +7001,10 @@ function apply(ctx) {
             const st = cp.stats();
             const enabled = loadConfig().cueprompt?.enabled ? "开" : "关";
             const v = st.verdicts || { confirmed: 0, denied: 0, objected: 0, silent: 0 };
+            const modeName = String(loadConfig().cueprompt?.mode || "assist");
             const pctOf = (a) => (st.proposed ? `${((a / st.proposed) * 100).toFixed(1)}%` : "—");
             return [
-              `取词器/提词器：开关 ${enabled}｜重要 ${st.important} 条（生效 ${st.active}）｜回忆事件 ${st.events} 条（${st.eventMonths || 0} 个月）｜记错 ${st.misrecall} 条`,
+              `取词器/提词器：开关 ${enabled}｜模式 ${modeName}（shadow 只审计 / assist 照常 / enforce 只放高置信）｜重要 ${st.important} 条（生效 ${st.active}）｜回忆事件 ${st.events} 条（${st.eventMonths || 0} 个月）｜记错 ${st.misrecall} 条`,
               `数据链（最近 ${st.proposed} 次提出）：成功 ${v.confirmed} / 反对 ${v.objected} / 否认 ${v.denied} / 沉默 ${v.silent}（沉默率 ${pctOf(v.silent)}）`,
               `来源构成：事件 ${st.sourceMix?.event || 0} / 重要 ${st.sourceMix?.important || 0} / 常规 ${st.sourceMix?.normal || 0}｜平均置信度 ${st.avgConfidence === null || st.avgConfidence === undefined ? "—" : Number(st.avgConfidence).toFixed(2)}`,
             ].join(String.fromCharCode(10));

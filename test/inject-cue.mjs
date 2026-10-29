@@ -43,11 +43,16 @@ function ok(name, cond, extra = "") {
 }
 
 // 假 llm：createLlmCaller 要 resolveCallConfig + prepareCall().stream()
+// 2026-10-29：置信度可在用例里切换（enforce 模式要测「低置信不注入」）
+let FAKE_CONFIDENCE = 0.9;
 const fakeLlm = {
   resolveCallConfig: async ({ provider, model, maxTokens }) => ({ provider, model, maxTokens }),
   prepareCall: async () => ({
     stream: async function* () {
-      yield { type: "text-delta", text: '{"pick":1,"hint":"他之前说过邮件被批了两次","question":""}' };
+      yield {
+        type: "text-delta",
+        text: `{"pick":1,"confidence":${FAKE_CONFIDENCE},"hint":"他之前说过邮件被批了两次","question":""}`,
+      };
       yield { type: "finish", reason: { kind: "stop" } };
     },
   }),
@@ -223,6 +228,42 @@ try {
   const diagTxt = fs.readFileSync(path.join(TMP, "diag.log"), "utf8");
   ok("上一段没表态 → 作废（不挂到过期）", diagTxt.includes("上一段的待判作废"), diagTxt.slice(-120));
   ok("待判没挡住这回合重新取词", t4b.includes("<puppet_cue>"), t4b.slice(0, 80));
+
+  // ---- 借 dsh-memory-gate 的三个模式：shadow 只审计不注入 / enforce 低置信不注入
+  const writeCueConfig = (mode) => {
+    const cfgPath = path.join(TMP, "config.json");
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    cfg.cueprompt = { ...(cfg.cueprompt || {}), enabled: true, maxCandidates: 5, mode };
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg), "utf8");
+  };
+  const runMode = async (sessionId, userText) => {
+    const agentM = { session: { header: { id: sessionId, cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
+    const decision = await preStep({ agent: agentM }, async () => ({ kind: "enter", messages: [{ role: "user", content: [{ type: "text", text: userText }] }] }));
+    return (decision?.messages || [])
+      .map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || "")))
+      .join(String.fromCharCode(10));
+  };
+
+  writeCueConfig("shadow");
+  const shadowTurn = await runMode("cue-shadow", "邮件那件事你还记得吗");
+  ok("shadow：不往上下文里塞提示", !shadowTurn.includes("<puppet_cue>"), shadowTurn.slice(0, 80));
+  const diagShadow = fs.readFileSync(path.join(TMP, "diag.log"), "utf8");
+  ok("shadow：但记了「本应注入」", diagShadow.includes("shadow：本应注入"), diagShadow.slice(-120));
+  const evShadow = (fs.existsSync(path.join(TMP, "deep", "recall-events"))
+    ? fs.readdirSync(path.join(TMP, "deep", "recall-events")).filter((f) => /^\d{4}-\d{2}\.jsonl$/.test(f))
+    : []).flatMap((f) => readJsonl(path.join("deep", "recall-events", f)));
+  ok("shadow：事件照记（观察态也要有数据）", evShadow.length > 0, String(evShadow.length));
+
+  writeCueConfig("enforce");
+  FAKE_CONFIDENCE = 0.6; // 0.5–0.7 会被判中但置信不高
+  const enforceTurn = await runMode("cue-enforce", "邮件那件事你还记得吗");
+  ok("enforce：低置信不注入", !enforceTurn.includes("<puppet_cue>"), enforceTurn.slice(0, 80));
+  const diagEnforce = fs.readFileSync(path.join(TMP, "diag.log"), "utf8");
+  ok("enforce：记下「置信度不足未注入」", diagEnforce.includes("enforce：置信度"), diagEnforce.slice(-120));
+  FAKE_CONFIDENCE = 0.9;
+  const enforceHigh = await runMode("cue-enforce2", "邮件那件事你还记得吗");
+  ok("enforce：高置信照常注入", enforceHigh.includes("<puppet_cue>"), enforceHigh.slice(0, 80));
+  writeCueConfig("assist");
 
   // ---- ③④ 闭环：你说「不是这个」→ 本轮要摆出原文（或明说取不到），不能含糊过去
   const agent3 = { session: { header: { id: "cue-s3", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };

@@ -587,7 +587,19 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       }
     }
     // silent：什么都不改（丹阳 2026-10-29 定：沉默不加分）
-    if (row) rewriteJsonl(paths.important, rows);
+    if (row) {
+      // 证据多对多（借 dsh-memory-gate 的 evidence 表思路）：一条记忆可以挂多条证据，
+      // 每条带种类/引用/时间/权重；`evidence` 字符串仍然保留兼容，别的地方照旧读它。
+      const list = Array.isArray(row.evidenceList) ? row.evidenceList : [];
+      list.push({
+        kind: verdict === "confirmed" ? "confirm" : verdict === "objected" ? "object" : "deny",
+        ref: hash || "",
+        at: new Date(ts).toISOString(),
+        weight: verdict === "confirmed" ? 1 : 0,
+      });
+      row.evidenceList = list.slice(-10);
+      rewriteJsonl(paths.important, rows);
+    }
     return row || null;
   }
 

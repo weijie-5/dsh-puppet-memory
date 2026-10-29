@@ -152,6 +152,14 @@ try {
   const withLegacy = cp.readEvents(20);
   ok("兼容旧单文件事件", withLegacy.some((e) => e.session === "old"), JSON.stringify(withLegacy.map((e) => e.session)));
 
+  // ---- 借 dsh-memory-gate 的 evidence 多对多：一条记忆可以挂多条带种类的证据
+  const evA = cp.applyVerdict({ hash: "h-ev", topic: "证据测试", evidence: "第一次确认", verdict: "confirmed" });
+  cp.applyVerdict({ hash: "h-ev", topic: "证据测试", evidence: "第二次确认", verdict: "confirmed" });
+  const evRow2 = (cp.importantAll() || []).find((r) => (r.refs || []).includes("h-ev"));
+  ok("重要行有 evidenceList（多对多）", Boolean(evRow2 && Array.isArray(evRow2.evidenceList)), JSON.stringify(evRow2 && evRow2.evidenceList));
+  ok("证据累积了两条", Boolean(evRow2 && evRow2.evidenceList.length >= 2), String(evRow2 && evRow2.evidenceList.length));
+  ok("证据带种类", Boolean(evRow2 && evRow2.evidenceList.every((e) => ["confirm", "object", "deny"].includes(e.kind))));
+
   // ---- 7b. 沉默也记事件（丹阳 2026-10-29）：提出即落一条 silent，表态后改同一条
   const ev1 = cp.recordEvent({ session: "s6", pick: { hash: "h-silent", topic: "沉默测试" }, candidates: [], verdict: "silent", summary: "这条只提出、没表态" });
   ok("事件带 id（表态时对得上）", String(ev1.id || "").startsWith("ev-"), JSON.stringify(ev1.id));
