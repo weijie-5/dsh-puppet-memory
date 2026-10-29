@@ -240,12 +240,16 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       } catch {
         groups = [];
       }
+      let taken = 0;
       for (const g of groups) {
-        if (out.length >= limit) break;
+        // 自我强化的闸（丹阳 2026-10-29「这样回忆会更想回忆」）：事件总结是我自己的判断，
+        // 喂回取词等于「回忆过的更容易再被回忆」——所以①最多占 2 个候选，②要至少两个二字词重合才进。
+        if (out.length >= limit || taken >= 2) break;
         const text = `${g.topic || ""} ${g.summary || ""}`;
         if (!String(g.summary || "").trim()) continue;
-        const shared = bigramsOf(text).some((x) => grams.has(x));
-        if (!shared) continue;
+        const shared = bigramsOf(text).filter((x) => grams.has(x)).length;
+        if (shared < 2) continue;
+        taken += 1;
         out.push({
           hash: `ev:${g.key}`,
           text: `[event] ${g.topic || g.key}｜${String(g.summary).slice(0, 160)}`,
