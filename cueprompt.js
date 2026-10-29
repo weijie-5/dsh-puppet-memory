@@ -230,7 +230,33 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       if (out.length >= limit) break;
     }
 
-    // ② 常规库：调外部检索函数（工具里就是 memory_search 的那套）
+    // ② 事件总结：我自己综合判断过、写进事件的回忆（丹阳 2026-10-29：
+    //    「你自己的综合判断再回忆后就是以后的回忆部分」）——放在常规检索之前，
+    //    因为它是有结论的，不是散条目；没总结的旧事件不参与。
+    if (out.length < limit) {
+      let groups = [];
+      try {
+        groups = groupEvents(readEvents(400));
+      } catch {
+        groups = [];
+      }
+      for (const g of groups) {
+        if (out.length >= limit) break;
+        const text = `${g.topic || ""} ${g.summary || ""}`;
+        if (!String(g.summary || "").trim()) continue;
+        const shared = bigramsOf(text).some((x) => grams.has(x));
+        if (!shared) continue;
+        out.push({
+          hash: `ev:${g.key}`,
+          text: `[event] ${g.topic || g.key}｜${String(g.summary).slice(0, 160)}`,
+          where: "deep/recall-events",
+          kind: "event",
+          eventKey: g.key,
+        });
+      }
+    }
+
+    // ③ 常规库：调外部检索函数（工具里就是 memory_search 的那套）
     if (out.length < limit && typeof searchFn === "function") {
       let hits = [];
       try {
@@ -249,7 +275,7 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
         out.push({ hash: h.hash, text: String(h.text || "").slice(0, 200), where: String(h.where || "search"), kind: "normal" });
       }
     }
-    // ③ 重要库兜底：常规也空 → 再扫一遍重要（丹阳 2026-10-29：「可以再取」）
+    // ④ 重要库兜底：常规也空 → 再扫一遍重要（丹阳 2026-10-29：「可以再取」）
     if (!out.length) {
       for (const imp of importantAll()) {
         if (String(imp.state || "active") !== "active") continue;
@@ -264,7 +290,8 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
         if (out.length >= limit) break;
       }
     }
-    return { candidates: out, blocked: blockedCount, fromImportant, fromNormal: out.length - fromImportant };
+    const fromEvent = out.filter((c) => c.kind === "event").length;
+    return { candidates: out, blocked: blockedCount, fromImportant, fromEvent, fromNormal: out.length - fromImportant - fromEvent };
   }
 
   /** 提词器：让模型判断「这批候选里哪几条构成回忆」，并给一句自然语言提示 */

@@ -2781,6 +2781,23 @@ function entryByHashPrefix(prefix) {
 
 /** v0.39（B-94 ③）：反对之后回原文——有门牌就取那一段，没门牌就说明「位置未知」，不猜 */
 function verifyExcerptOf(hash) {
+  // 事件候选（ev:<话题>）：原文就是我写进事件的那句总结 + 它挂在哪几条谈话上
+  const h = String(hash || "");
+  if (h.startsWith("ev:")) {
+    try {
+      const key = h.slice(3);
+      const g = cuePrompterFor().groupEvents(cuePrompterFor().readEvents(400)).find((x) => x.key === key);
+      if (!g) return { text: "", gate: `事件「${key}」找不到（可能还没写总结）` };
+      const rows = [];
+      if (g.summary) rows.push(`总结：${g.summary}`);
+      if (g.samples && g.samples.length > 1) rows.push(`以前的说法：${g.samples.slice(1).join("；")}`);
+      rows.push(`共 ${g.count} 次回忆（成功 ${g.confirmed} / 失败 ${g.denied} / 反对 ${g.objected} / 沉默 ${g.silent}）`);
+      const NL = String.fromCharCode(10);
+      return { text: rows.join(NL).slice(0, 320), gate: `事件「${g.topic || key}」· 最近 ${String(g.lastAt || "").slice(0, 16)}` };
+    } catch (err) {
+      return { text: "", gate: `取事件失败：${err?.message || err}` };
+    }
+  }
   const found = entryByHashPrefix(hash);
   if (!found) return { text: "", gate: "找不到条目本体（可能在归档里）" };
   const entry = found.entry || {};
@@ -6321,9 +6338,11 @@ function apply(ctx) {
             let cueHandledThisTurn = false; // 一回合只做一件事：判了成败/摆了原文，就不再新取词
             if (pending?.hash && userText) {
               const verdict = verdictOf(userText);
+              const isEventCand = String(pending.hash).startsWith("ev:");
               if (verdict !== "silent") {
-                cp.applyVerdict({ hash: pending.hash, importantId: pending.importantId || "", topic: pending.topic || "", verdict, session: sessionId });
-                cp.recordEvent({ session: sessionId, pick: pending, candidates: pending.candidates || [], verdict, summary: pending.summary || pending.hint || "", topic: pending.topic || "" });
+                // 事件候选不是记忆条目：只在事件表里再记一条，不升重要、不进记错表
+                if (!isEventCand) cp.applyVerdict({ hash: pending.hash, importantId: pending.importantId || "", topic: pending.topic || "", verdict, session: sessionId });
+                cp.recordEvent({ session: sessionId, pick: pending, candidates: pending.candidates || [], verdict, summary: pending.eventSummary || pending.summary || pending.hint || "", topic: pending.topic || "" });
                 diag(`回忆判定：${verdict}（#${String(pending.hash || "").slice(0, 8)}）`);
                 // ③④ 闭环：被反对 → 立刻回原文核对，本轮就把原话摆出来再回答
                 if (verdict === "objected") {
@@ -6348,7 +6367,7 @@ function apply(ctx) {
                 searchFn: (q, n) => cueHitsOf(q, n),
                 limit: Number(cfg.cueprompt.maxCandidates) || 7,
               });
-              diag(`取词：候选 ${picked.candidates.length}（重要 ${picked.fromImportant} / 常规 ${picked.fromNormal} / 记错跳过 ${picked.blocked}）`);
+              diag(`取词：候选 ${picked.candidates.length}（重要 ${picked.fromImportant} / 事件 ${picked.fromEvent || 0} / 常规 ${picked.fromNormal} / 记错跳过 ${picked.blocked}）`);
               // 路由要从会话 header 取：不传 session 时宿主里拿不到默认模型，caller 会是 null（实测踩到）
               const caller = picked.candidates.length
                 ? createLlmCaller({ session: agent?.session || null, model: cfg.cueprompt.model || null })
@@ -6371,7 +6390,15 @@ function apply(ctx) {
                 });
                 diag(`提词：${judged.pick ? "判定为回忆" : "判为不构成回忆"}${judged.error ? `（错误：${judged.error}）` : ""}${judged.hint ? ` hint=${clip(judged.hint, 40)}` : ""}`);
                 if (judged.pick) {
-                  cp.savePending(sessionId, { ...judged.pick, topic: "", candidates: picked.candidates });
+                  // 事件候选：topic 用事件键，判定时新事件能并回同一组；总结沿用事件原来的那句
+                  const isEv = judged.pick?.kind === "event";
+                  const evSummary = isEv ? String(judged.pick.text || "").split("｜").slice(1).join("｜").trim() : "";
+                  cp.savePending(sessionId, {
+                    ...judged.pick,
+                    topic: isEv ? String(judged.pick.eventKey || "") : "",
+                    eventSummary: evSummary,
+                    candidates: picked.candidates,
+                  });
                   const rows = ["（提示：这件事你和他之前聊过。若自然就用平常语气带出来，别罗列资料、别贴编号）", judged.hint];
                   if (judged.question) rows.push(`（拿不准可以先问一句：${judged.question}）`);
                   cueText = ["<puppet_cue>", rows.join("\n"), "</puppet_cue>"].join("\n");
