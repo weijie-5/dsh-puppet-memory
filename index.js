@@ -6419,7 +6419,18 @@ function apply(ctx) {
               const isEventCand = String(pending.hash).startsWith("ev:");
               if (verdict !== "silent") {
                 // 事件候选不是记忆条目：只在事件表里再记一条，不升重要、不进记错表
-                if (!isEventCand) cp.applyVerdict({ hash: pending.hash, importantId: pending.importantId || "", topic: pending.topic || "", verdict, session: sessionId });
+                if (!isEventCand) {
+                  // 升重要时把「事由」一起带上：之前只传 hash，升出来的行 topic/evidence 全空，
+                  // 取词命中它会生成一条没内容的候选（2026-10-29 实测到两条空行）
+                  cp.applyVerdict({
+                    hash: pending.hash,
+                    importantId: pending.importantId || "",
+                    topic: pending.topic || "",
+                    evidence: pending.eventSummary || pending.hint || "",
+                    verdict,
+                    session: sessionId,
+                  });
+                }
                 // 事件在「提出这条回忆」时就已经落盘（verdict=silent），这里只把同一条改成最终判定
                 const patched = pending.eventId
                   ? cp.updateEvent({ id: pending.eventId, patch: { verdict, summaryBy: verdict === "confirmed" ? "both" : "ai" } })
