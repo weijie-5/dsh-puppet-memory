@@ -2813,6 +2813,26 @@ function verifyExcerptOf(hash) {
   }
 }
 
+/** 最近两段真实用户发言（[0]=这一段，[1]=上一段）；插件自己注入的不算 */
+function recentUserTexts(messages = [], n = 2) {
+  const out = [];
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= 0 && out.length < n; i -= 1) {
+    const m = list[i];
+    if (!m || m.role !== "user") continue;
+    const src = m.source || {};
+    if (src.kind && String(src.kind).startsWith("plugin:")) continue;
+    const t = typeof m.content === "string"
+      ? m.content
+      : Array.isArray(m.content)
+        ? m.content.map((b) => (b && b.type === "text" ? b.text || "" : "")).join(String.fromCharCode(10))
+        : "";
+    if (!String(t || "").trim()) continue;
+    out.push(t);
+  }
+  return out;
+}
+
 /** 把 memory_search 的文本结果转成提词器的候选（只要 hash/摘要/来源） */
 function cueHitsOf(query, n = 7) {
   try {
@@ -6331,11 +6351,16 @@ function apply(ctx) {
           if (!suppressed.has("due")) dueText = buildDueInjection(cfg);
 
           // v0.39（B-94）：取词器 + 提词器。默认关；开着时每回合可能多一次小模型调用。
+          // 丹阳 2026-10-29 定的分工：取词器**每回合取新词**（不被待判堵住）；
+          // 提词器只看「上一段 + 这一段」（更早的作废），用来判这条算不算回忆、以及你上句是确认还是否认。
           if (cfg.cueprompt?.enabled) {
-            const userText = stripInjected(lastUserText(decision.messages || []).text);
+            const NL = String.fromCharCode(10);
+            const texts = recentUserTexts(decision.messages || []).map((t) => stripInjected(t));
+            const userText = texts[0] || "";
+            const prevText = texts[1] || "";
             const cp = cuePrompterFor();
             const pending = cp.loadPending(sessionId);
-            let cueHandledThisTurn = false; // 一回合只做一件事：判了成败/摆了原文，就不再新取词
+            let actedThisTurn = false; // 这回合判过成败/摆过原文 → 不再抛新回忆（但待判本身不挡取词）
             if (pending?.hash && userText) {
               const verdict = verdictOf(userText);
               const isEventCand = String(pending.hash).startsWith("ev:");
@@ -6351,18 +6376,22 @@ function apply(ctx) {
                     "（你上次说「不是这个」——也就是我说偏了。下面是原文，对照一下再回答，别再用「记不清」结案）",
                     `门牌：${ex.gate}`,
                   ];
-                  if (ex.text) rows.push(`原文摘录：\n${ex.text}`);
+                  if (ex.text) rows.push(`原文摘录：${NL}${ex.text}`);
                   else rows.push("原文取不到 → 老实说「我查不到那段原话」，不要编。");
                   rows.push("核对完二选一：原文支持我 → 修正表述重说一遍；原文不支持 → 用 memory_cue demote 把这条降级。");
-                  cueText = ["<puppet_verify>", rows.join("\n"), "</puppet_verify>"].join("\n");
+                  cueText = ["<puppet_verify>", rows.join(NL), "</puppet_verify>"].join(NL);
                   diag(`反对后回原文：${ex.text ? "取到" : "没取到"}（${ex.gate}）`);
                 }
                 cp.clearPending(sessionId);
-                cueHandledThisTurn = true;
+                actedThisTurn = true;
+              } else {
+                // 上一段没表态 → 作废（不留到过期，也不记账：沉默不加分）
+                cp.clearPending(sessionId);
+                diag("上一段的待判作废（他没表态）");
               }
             }
             const gate = worthCueing(userText);
-            if (!cueText && !cueHandledThisTurn && !cp.loadPending(sessionId) && gate.ok) {
+            if (!cueText && !actedThisTurn && gate.ok) {
               const picked = cp.pickCandidates({
                 userText,
                 searchFn: (q, n) => cueHitsOf(q, n),
@@ -6385,9 +6414,10 @@ function apply(ctx) {
               if (caller) {
                 const judged = await cp.judge({
                   userText,
+                  prevUserText: prevText,
                   candidates: picked.candidates,
                   maxHintChars: Number(cfg.cueprompt.maxHintChars) || 140,
-                  callModel: ({ system, user }) => caller({ prompt: `${system}\n\n${user}`, maxTokens: 500, timeoutMs: 15000 }),
+                  callModel: ({ system, user }) => caller({ prompt: `${system}${NL}${NL}${user}`, maxTokens: 500, timeoutMs: 15000 }),
                 });
                 if (judged.echo) diag(`提词：判为自我复述（相似度 ${judged.echoSim}），不算回忆`);
                 else diag(`提词：${judged.pick ? "判定为回忆" : "判为不构成回忆"}${judged.error ? `（错误：${judged.error}）` : ""}${judged.hint ? ` hint=${clip(judged.hint, 40)}` : ""}`);
@@ -6400,10 +6430,11 @@ function apply(ctx) {
                     topic: isEv ? String(judged.pick.eventKey || "") : "",
                     eventSummary: evSummary,
                     candidates: picked.candidates,
+                    prevUserText: prevText,
                   });
                   const rows = ["（提示：这件事你和他之前聊过。若自然就用平常语气带出来，别罗列资料、别贴编号）", judged.hint];
                   if (judged.question) rows.push(`（拿不准可以先问一句：${judged.question}）`);
-                  cueText = ["<puppet_cue>", rows.join("\n"), "</puppet_cue>"].join("\n");
+                  cueText = ["<puppet_cue>", rows.join(NL), "</puppet_cue>"].join(NL);
                 }
               }
             }

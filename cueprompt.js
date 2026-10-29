@@ -328,7 +328,7 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
   }
 
   /** 提词器：让模型判断「这批候选里哪几条构成回忆」，并给一句自然语言提示 */
-  async function judge({ userText, candidates, callModel, maxHintChars = 140 }) {
+  async function judge({ userText, candidates, callModel, maxHintChars = 140, prevUserText = "" }) {
     if (!candidates.length) return { pick: null, hint: "", question: "" };
     if (typeof callModel !== "function") return { pick: null, hint: "", question: "", error: "没有可用的小模型路由" };
     const sys = [
@@ -340,11 +340,13 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       "若有两三条都像、且时间跨度大：pick 填最可能的一条，question 写一句要问对方的话（≤40 字，如「你说的是上周那次还是更早？」）。",
       '只输出 JSON：{"pick":序号,"confidence":0.0,"hint":"…","question":"…"}',
     ].join("\n");
+    const NL2 = String.fromCharCode(10);
     const user = [
+      ...(String(prevUserText || "").trim() ? [`【他上一段说的】${String(prevUserText).slice(0, 300)}`] : []),
       `【现在的用户消息】${String(userText).slice(0, 400)}`,
       "【候选记忆】",
       ...candidates.map((c, i) => `${i + 1}. ${c.text}`),
-    ].join("\n");
+    ].join(NL2);
     let raw = "";
     try {
       raw = await callModel({ system: sys, user });

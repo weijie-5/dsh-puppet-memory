@@ -132,7 +132,31 @@ try {
   const mis = readJsonl("deep/misrecall.jsonl");
   ok("否认写进了记错表", mis.length >= 1, JSON.stringify(mis[0] || {}));
 
-  ok("判定后待判回忆被清掉", !fs.existsSync(path.join(TMP, "state", "cue-pending.json")) || !Object.keys(JSON.parse(fs.readFileSync(path.join(TMP, "state", "cue-pending.json"), "utf8"))).includes("cue-s1"), "清理失败");
+  // 2026-10-29 改：取词器每回合取新词，所以 pending 会被新的替换；这里核的是「被判过的那条」已经清掉
+  const pendDoc = fs.existsSync(path.join(TMP, "state", "cue-pending.json"))
+    ? JSON.parse(fs.readFileSync(path.join(TMP, "state", "cue-pending.json"), "utf8"))
+    : {};
+  ok(
+    "判定过的那条待判已清掉（pending 可以换成新取的）",
+    !pendDoc["cue-s1"] || String(pendDoc["cue-s1"].hash || "") !== "aaaa1111bbbb2222",
+    JSON.stringify(pendDoc["cue-s1"] || {}),
+  );
+
+  // ---- 新规矩（2026-10-29）：待判不挡取词；上一段没表态就作废（独立会话 cue-s4 验）
+  const agent4 = { session: { header: { id: "cue-s4", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
+  const run4 = async (userText) => {
+    const messages = [{ role: "user", content: [{ type: "text", text: userText }] }];
+    const decision = await preStep({ agent: agent4 }, async () => ({ kind: "enter", messages }));
+    return (decision?.messages || [])
+      .map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || "")))
+      .join(String.fromCharCode(10));
+  };
+  const t4a = await run4("邮件那件事你还记得吗");
+  ok("会话 cue-s4：先取到一条回忆", t4a.includes("<puppet_cue>"), t4a.slice(0, 80));
+  const t4b = await run4("顺手把手册补完");
+  const diagTxt = fs.readFileSync(path.join(TMP, "diag.log"), "utf8");
+  ok("上一段没表态 → 作废（不挂到过期）", diagTxt.includes("上一段的待判作废"), diagTxt.slice(-120));
+  ok("待判没挡住这回合重新取词", t4b.includes("<puppet_cue>"), t4b.slice(0, 80));
 
   // ---- ③④ 闭环：你说「不是这个」→ 本轮要摆出原文（或明说取不到），不能含糊过去
   const agent3 = { session: { header: { id: "cue-s3", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };

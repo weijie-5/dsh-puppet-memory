@@ -48,6 +48,19 @@ try {
   ok("候选≈他这句话＝自我复述", selfEchoOf("这里是qq机器人", "[normal] 他说过：这里是qq机器人").echo === true);
   ok("候选是别的事→不算复述", selfEchoOf("流浪地球3那个", "[event] 数字生命·完整的一生｜社区里有人真想做").echo === false);
 
+  // ---- 1c. 提词器只看「上一段 + 这一段」（丹阳 2026-10-29）
+  let seenPrompt = "";
+  await cp.judge({
+    userText: "不是这个",
+    prevUserText: "上次说的那个取词器",
+    candidates: [{ hash: "h-prev", text: "[normal] 取词器的事", where: "x", kind: "normal" }],
+    callModel: async ({ user }) => {
+      seenPrompt = user;
+      return '{"pick":0,"hint":""}';
+    },
+  });
+  ok("提词器能看到「上一段 + 这一段」", seenPrompt.includes("他上一段说的") && seenPrompt.includes("不是这个"), seenPrompt.slice(0, 60));
+
   // ---- 2. 重要库优先 + 常规补充
   writeJsonl("deep/important.jsonl", [
     { id: "imp-a", topic: "邮件被批两次", refs: ["h-mail"], evidence: "10-21 他说邮件被批了两次", count: 2, fails: 0, state: "active" },
