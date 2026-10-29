@@ -209,30 +209,9 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     let blockedCount = 0;
     let fromImportant = 0;
 
-    // ① 重要库优先：主题词/引用条目的关键词有重合就拿出来
-    for (const imp of importantAll()) {
-      if (String(imp.state || "active") !== "active") continue;
-      const words = bigramsOf(`${imp.topic || ""} ${(imp.refs || []).join(" ")}`);
-      const shared = words.some((g) => grams.has(g));
-      if (!shared) continue;
-      if ((imp.refs || []).some((h) => isBlocked(h, imp.topic, blocked))) {
-        blockedCount += 1;
-        continue;
-      }
-      out.push({
-        hash: (imp.refs || [])[0] || imp.id,
-        text: `[important] ${imp.topic || ""}｜${(imp.evidence || "").slice(0, 120)}`,
-        where: "deep/important.jsonl",
-        kind: "important",
-        importantId: imp.id,
-      });
-      fromImportant += 1;
-      if (out.length >= limit) break;
-    }
-
-    // ② 事件总结：我自己综合判断过、写进事件的回忆（丹阳 2026-10-29：
-    //    「你自己的综合判断再回忆后就是以后的回忆部分」）——放在常规检索之前，
-    //    因为它是有结论的，不是散条目；没总结的旧事件不参与。
+    // ① 事件总结最先（丹阳 2026-10-29：「先看事件总结再看重要记忆才对」）：它是我综合判断过、
+    //    写进事件的结论（「你自己的综合判断再回忆后就是以后的回忆部分」），比带标记的条目更像回忆；
+    //    没总结的旧事件不参与。
     if (out.length < limit) {
       let groups = [];
       try {
@@ -258,6 +237,27 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
           eventKey: g.key,
         });
       }
+    }
+
+    // ② 重要库：主题词/引用条目的关键词有重合就拿出来
+    for (const imp of importantAll()) {
+      if (String(imp.state || "active") !== "active") continue;
+      const words = bigramsOf(`${imp.topic || ""} ${(imp.refs || []).join(" ")}`);
+      const shared = words.some((g) => grams.has(g));
+      if (!shared) continue;
+      if ((imp.refs || []).some((h) => isBlocked(h, imp.topic, blocked))) {
+        blockedCount += 1;
+        continue;
+      }
+      out.push({
+        hash: (imp.refs || [])[0] || imp.id,
+        text: `[important] ${imp.topic || ""}｜${(imp.evidence || "").slice(0, 120)}`,
+        where: "deep/important.jsonl",
+        kind: "important",
+        importantId: imp.id,
+      });
+      fromImportant += 1;
+      if (out.length >= limit) break;
     }
 
     // ③ 常规库：调外部检索函数（工具里就是 memory_search 的那套）

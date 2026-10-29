@@ -151,6 +151,9 @@ try {
   ok("事件总结能当取词候选", evPick.candidates.some((c) => c.kind === "event"), JSON.stringify(evPick.candidates.map((c) => c.kind)));
   ok("取词能分来源报事件数", Number.isInteger(evPick.fromEvent) && evPick.fromEvent >= 1, JSON.stringify({ fromEvent: evPick.fromEvent, fromNormal: evPick.fromNormal }));
   ok("事件候选最多占 2 个（防自我强化）", evPick.candidates.filter((c) => c.kind === "event").length <= 2, JSON.stringify(evPick.candidates.map((c) => c.kind)));
+  cp.recordEvent({ session: "s3", pick: { hash: "h-mail", topic: "邮件被批两次" }, verdict: "objected", summary: "他邮件被批过两次，第二次是因为格式" });
+  const priPick = cp.pickCandidates({ userText: "邮件被批那事", searchFn: () => [], limit: 5 });
+  ok("先看事件总结，再看重要库（丹阳定的顺序）", priPick.candidates[0]?.kind === "event", JSON.stringify(priPick.candidates.map((c) => c.kind)));
   const evCand = evPick.candidates.find((c) => c.kind === "event");
   ok("事件候选带事件键（判定时能并回同一组）", String(evCand?.hash || "").startsWith("ev:") && Boolean(evCand?.eventKey), JSON.stringify(evCand));
 
