@@ -94,6 +94,35 @@ export function stripInjected(text) {
   return t.replace(/[ \t]{2,}/g, " ").trim();
 }
 
+/** 输入门槛（probe v8 实测出来的第一道闸）：太短、没有可取的二字词，就不值得跑取词+提词 */
+export function worthCueing(text) {
+  const t = stripInjected(text);
+  const han = (t.match(/[一-鿿]/g) || []).length;
+  const latin = (t.match(/[A-Za-z]{2,}/g) || []).length;
+  if (han + latin < 4) return { ok: false, reason: "太短（不足 4 个字/词）" };
+  const grams = bigramsOf(t);
+  if (grams.length < 2) return { ok: false, reason: "没有可取的二字词" };
+  return { ok: true, grams: grams.length, han };
+}
+
+/** 自我复述（第二道闸）：候选条目本身≈他这句话时，那不是「回忆」，是把他的话存了一遍 */
+export function selfEchoOf(userText, candidateText) {
+  const norm = (x) =>
+    String(x || "")
+      .replace(/^\[[a-z]+\]\s*/i, "")
+      .replace(/^[^｜]{0,12}｜/, "")
+      .replace(/[\s\p{P}\p{S}]/gu, "");
+  const A = bigramsOf(norm(userText));
+  const B = bigramsOf(norm(candidateText));
+  if (!A.length || !B.length) return { echo: false, sim: 0 };
+  const setB = new Set(B);
+  const shared = A.filter((g) => setB.has(g)).length;
+  const dice = (2 * shared) / (A.length + B.length);
+  // 只有「几乎逐字」才算复述（0.6 会误杀真回忆——记忆本来就是同一件事，词面天然重合）
+  const contained = norm(userText).length <= 12 && norm(candidateText).includes(norm(userText));
+  return { echo: dice >= 0.88 || contained, sim: Number(dice.toFixed(2)) };
+}
+
 /** 从对方那句话判断「上一次回忆」的反应类型；沉默/其它 = silent（不加分） */
 export function verdictOf(text) {
   const t = stripInjected(text);
@@ -305,6 +334,7 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     const sys = [
       "你是「提词器」。任务：从候选记忆里判断，哪一条与用户这句话构成**同一件具体的事**的回忆。",
       "判定要严：必须是同样的事实/约定/经历/细节；只是词面相似、通用常识、或用户其实在说别的事，都不算。",
+      "还要看信息增益：如果这条记忆只是把他刚说的这句话换个说法存了一遍、没有补出他没说的东西（时间/地点/前因后果/后续/谁在场），不算回忆。",
       "若有把握：pick 填序号；confidence 填 0–1 的把握（这条和用户这句话真的是同一件事吗）；hint 写一句自然语言提示（≤80 字，像提醒自己「他提过 X」，不要罗列资料、不要写编号）。",
       "若不构成回忆：pick 填 0，hint 空。",
       "若有两三条都像、且时间跨度大：pick 填最可能的一条，question 写一句要问对方的话（≤40 字，如「你说的是上周那次还是更早？」）。",
@@ -332,6 +362,12 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     const idx = Number(parsed.pick);
     if (!Number.isInteger(idx) || idx < 1 || idx > candidates.length) {
       return { pick: null, hint: "", question: "", confidence: 0, dismissed: true };
+    }
+    const pickedCand = candidates[idx - 1];
+    const echo = selfEchoOf(userText, pickedCand?.text || "");
+    if (echo.echo) {
+      // 候选就是他这句话本身（或几乎一样）：这是存档，不是回忆
+      return { pick: null, hint: "", question: "", confidence: 0, dismissed: true, echo: true, echoSim: echo.sim };
     }
     const confidence = Number.isFinite(Number(parsed.confidence)) ? Math.max(0, Math.min(1, Number(parsed.confidence))) : 0.7;
     // 置信度分级：低于 0.5 当作没回忆（宁可不提，也别糊弄）；0.5–0.7 说的时候带「不确定」

@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createCuePrompter, bigramsOf, stripInjected, verdictOf } from "../cueprompt.js";
+import { createCuePrompter, bigramsOf, selfEchoOf, stripInjected, verdictOf, worthCueing } from "../cueprompt.js";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-cueprompt-"));
 fs.mkdirSync(path.join(TMP, "deep"), { recursive: true });
@@ -41,6 +41,12 @@ try {
   ok("「我没记错」当反对，回原文核对（不直接罚）", verdictOf("我没记错") === "objected");
   ok("注入块不进判读", verdictOf("<system-reminder>技能目录变了</system-reminder>那是我记错了") === "silent");
   ok("剥注入块只留他的话", stripInjected("<system-reminder>a</system-reminder>\n<puppet_cue>x</puppet_cue>他在吗") === "他在吗");
+
+  // ---- 1b. 两道闸（probe v8 实测出来的）
+  ok("太短的句子不取词", worthCueing("嗯").ok === false, JSON.stringify(worthCueing("嗯")));
+  ok("正常句子照取", worthCueing("还记得你为什么变成雪风吗").ok === true);
+  ok("候选≈他这句话＝自我复述", selfEchoOf("这里是qq机器人", "[normal] 他说过：这里是qq机器人").echo === true);
+  ok("候选是别的事→不算复述", selfEchoOf("流浪地球3那个", "[event] 数字生命·完整的一生｜社区里有人真想做").echo === false);
 
   // ---- 2. 重要库优先 + 常规补充
   writeJsonl("deep/important.jsonl", [
@@ -82,6 +88,8 @@ try {
   const good = await cp.judge({ userText: "邮件那件事", candidates: cand, callModel: async () => '{"pick":1,"hint":"他提过邮件被批两次","question":""}' });
   ok("判定命中", good.pick && good.hint.includes("邮件"));
   const none = await cp.judge({ userText: "邮件那件事", candidates: cand, callModel: async () => '{"pick":0,"hint":"","question":""}' });
+  const echoDrop = await cp.judge({ userText: "这里是qq机器人", candidates: [{ hash: "h-echo", text: "[normal] 他说过：这里是qq机器人", where: "x", kind: "normal" }], callModel: async () => '{"pick":1,"confidence":0.95,"hint":"他提过这里是qq机器人"}' });
+  ok("提词器认出自我复述就丢弃（不注入 cue）", !echoDrop.pick && echoDrop.echo === true, JSON.stringify(echoDrop));
   ok("判定不构成回忆 → 不给提示", none.pick === null && none.hint === "");
   const broken = await cp.judge({ userText: "x", candidates: cand, callModel: async () => "我觉得是吧" });
   ok("模型输出非 JSON → 报错不崩", broken.pick === null && Boolean(broken.error));

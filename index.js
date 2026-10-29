@@ -36,7 +36,7 @@ import { createSocial, detectScene, normalizeName, personIdOf, registerSocialToo
 import { behaviorHint, createLines, lastUserText, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens } from "./state.js";
 import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPaths } from "./sessionmem.js";
 import { createSearchIndex, sqliteAvailable, sqliteUnavailableReason } from "./searchindex.js";
-import { bigramsOf, createCuePrompter, stripInjected, verdictOf } from "./cueprompt.js";
+import { bigramsOf, createCuePrompter, selfEchoOf, stripInjected, verdictOf, worthCueing } from "./cueprompt.js";
 import { createRules, formatRuleRow, parseRulesMarkdown, rulesDefaults } from "./rules.js";
 
 const PLUGIN_NAME = "dsh-puppet-memory";
@@ -6361,7 +6361,8 @@ function apply(ctx) {
                 cueHandledThisTurn = true;
               }
             }
-            if (!cueText && !cueHandledThisTurn && !cp.loadPending(sessionId) && String(userText || "").trim().length >= 2) {
+            const gate = worthCueing(userText);
+            if (!cueText && !cueHandledThisTurn && !cp.loadPending(sessionId) && gate.ok) {
               const picked = cp.pickCandidates({
                 userText,
                 searchFn: (q, n) => cueHitsOf(q, n),
@@ -6388,7 +6389,8 @@ function apply(ctx) {
                   maxHintChars: Number(cfg.cueprompt.maxHintChars) || 140,
                   callModel: ({ system, user }) => caller({ prompt: `${system}\n\n${user}`, maxTokens: 500, timeoutMs: 15000 }),
                 });
-                diag(`提词：${judged.pick ? "判定为回忆" : "判为不构成回忆"}${judged.error ? `（错误：${judged.error}）` : ""}${judged.hint ? ` hint=${clip(judged.hint, 40)}` : ""}`);
+                if (judged.echo) diag(`提词：判为自我复述（相似度 ${judged.echoSim}），不算回忆`);
+                else diag(`提词：${judged.pick ? "判定为回忆" : "判为不构成回忆"}${judged.error ? `（错误：${judged.error}）` : ""}${judged.hint ? ` hint=${clip(judged.hint, 40)}` : ""}`);
                 if (judged.pick) {
                   // 事件候选：topic 用事件键，判定时新事件能并回同一组；总结沿用事件原来的那句
                   const isEv = judged.pick?.kind === "event";
