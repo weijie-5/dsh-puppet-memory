@@ -1,6 +1,6 @@
 # 木偶记忆（Puppet Memory）
 
-> ⚠️ **main 分支是开发中的版本，可能比 Release 新**。当前最新发布为 `0.37.1`（2026-10-28，兼容 DSH 0.2.1-rc.3），新增**检索查询参数 / 规则册数据化 / 注入三改**（带「现在」、事件触发取记忆、交接纸条）。0.37.1 是热修：`memory_rules` 在 0.37.0 里因漏 `output` 声明没注册上。历史稳定版见 Release 列表。开发过程记录在 `过程/` 目录。
+> ⚠️ **main 分支是开发中的版本，可能比 Release 新**。当前最新发布为 `0.37.1`（2026-10-28，兼容 DSH 0.2.1-rc.3）；**main 上是 0.39.0-dev**（取词器/提词器、到期提醒、SQLite 派生索引，未发布），新增**检索查询参数 / 规则册数据化 / 注入三改**（带「现在」、事件触发取记忆、交接纸条）。0.37.1 是热修：`memory_rules` 在 0.37.0 里因漏 `output` 声明没注册上。历史稳定版见 Release 列表。开发过程记录在 `过程/` 目录。
 
 > 原名 `dsh-memory`，2026-10-20 更名。DSH（DeepSeek Harness）的跨会话记忆插件：记忆按用途分五层打底（常驻 / 按需·行为 / 按需·知识 / 账本 / 临时），外加三线状态、多人多群、会话级记忆管理。
 
@@ -372,6 +372,7 @@ API 对应三个动作：`GET ?action=fact-candidates&limit=`（列表 + `pendin
 | `memory_write` | 写关系 / 用户档案 / 便签 / 常言 / 笔记 / 人设 / 日记；`images`/`audios` 可带图片或音频一起存（音频可配 `transcripts` 转写），`tags` 可打分类标签，`note` 可写备注，`source`+`quote` 记出处（原文/转述）；返回里带 `hash` |
 | `memory_search` | 按层检索（behavior/deep/array/user/memo/all，`layer` 可逗号写多层或有 `layers` 数组）；多词用空格/顿号分隔、默认取交集；`tag` 按标签；`since`/`until` 时间窗；`status` 三态；`kind`（`rule` 直接查规则册） |
 | `memory_rules` | 规则册只读视图：`action=list`（默认只列生效，可按 `level`/`state`）、`action=get id=R-12`、`action=search query=…`；读派生索引 `deep/rules.jsonl`，md 改了自动重建 |
+| `memory_cue` | 取词器/提词器（B-94）：`action=list` 看重要库、`events` 看回忆事件（按话题归并，带一句总结和「我的一步 / 双方」溯源）、`misrecall` 看记错表、`forget` 删一条记错、`promote`/`demote` 手动升降、`stats` 汇总 |
 | `memory_locate` | 用 `hash`（可只给前 8 位）或 `keyword` 精确定位原文：返回 文件:行号 + 完整 JSONL 行，用于「摘要只剩一句话、想找回原话」 |
 | `memory_stats` | 记忆规模、图片/音频资产（张数/段数/体积）、标签汇总、开关状态、最近备份 |
 | `memory_image` | 管理记忆资产：`action=list` 列出图片与音频（音频带分类〔来源·内容·用途〕与时长，可按三组筛选，带已登记出处）、`action=meta` 看单条详情、`action=rename` 改名并同步更新所有引用和出处表 |
@@ -386,7 +387,7 @@ API 对应三个动作：`GET ?action=fact-candidates&limit=`（列表 + `pendin
 | `memory_handoff` | 工作台移交：`send` 留一条交接 / `pull` 取走即标记 / `list` 查看，用于不同会话、不同工作区之间接力 |
 | `memory_export` | 导出档案：往 `~/.dsh/memory-exports/export-<时间>/` 写「档案.md」（人读）+「data.json」（机器读），含三张卡、各层条目、最近日记、标废记录、手册、会话索引；只读，不改记忆 |
 
-> 这里只列常用项。完整清单（26 个工具，含多人多群 4 个）见《全功能说明》第三节。
+> 这里只列常用项。完整清单（27 个工具，含多人多群 4 个）见《全功能说明》第三节。
 
 ## 唯一性与哈希定位
 
@@ -885,6 +886,8 @@ Copy-Item '<profile 备份目录>\*' '<你的用户名>\.dsh\profiles\<profile>\
 插件自身异常只影响它自己（工具不注册 / 注入为空），宿主启动时会记录错误但继续跑；排查看 `~/.dsh/memory/diag.log`。
 
 ## 版本历史
+- **0.39.0-dev（2026-10-29，未发布）**：**取词器 + 提词器（B-94，两步两分）**，默认关（`config.cueprompt.enabled`），开着时每回合可能多一次小模型调用。取词器只管取：从你这句话取二字词，按 **事件总结 → 重要库 → 常规检索 → 常规为空回扫重要** 出候选（每回合最多 7 条；事件最多占 2 条、要两个词重合——防「回忆过的更容易再被回忆」）；提词器只管判：小模型判断这批候选里哪条和你这句话是同一件事，置信度 <0.5 不出提示、0.5–0.7 带「我不太确定」。判定分三种：确认 +1（两次确认升重要，放 `deep/important.jsonl`，常规检索不再检索它）；反对只记 `objections`，并且**当场翻原文和门牌核对**；否认记失败并进记错表（30 天），回原文确认后自动撤销。每次回忆落一条事件（按月分片 + 月索引），事件带一句**总结**和溯源（`summaryBy`: `ai`=我的一步 / `both`=双方确认）。新增工具 `memory_cue`。实机修的两处：注入块（`<system-reminder>`/`<puppet_*>`）被当成用户发言；「那是我记错了」被误判成否认（判读要认主语）。测试 49 套全绿（`cueprompt` 58 / `inject-cue` 22 / `provenance-gate` 16 / `due` 26 / `search-index` 25 等）。
+- **0.38.0-dev（2026-10-29，未发布）**：**到期提醒（B-86，默认关）**——只做「欠着的事」一种：条目带 `until` 到期就自动推一条汇总，零模型调用、复用 B-74 的时间字段，不加新数据格式；**SQLite 派生索引（B-70，默认不切）**——真源仍是 JSONL，索引可整份删掉重放、按文件签名增量重建，`config.search.engine=scan|sqlite`；本机 7344 条实测 scan 5.03 ms / sqlite 46.51 ms（慢 9 倍），所以默认仍是 `scan`，代码留作备用。
 - **0.37.1（2026-10-28）**：**热修**——`memory_rules` 在 0.37.0 里注册失败（漏了宿主要求的 `output { schema, render }` 声明），工具表里根本没有它。补上声明，并新增 `test/tool-contract.mjs`（17 项）：照宿主的校验规则检查每个工具都声明了 `output`、参数是 object schema、`output.render` 用空值也不抛；负测验过——去掉声明立刻变红。工具数 26 保持不变，只是 0.37.0 里第 26 个没装上。
 - **0.37.0（2026-10-28）**：**检索能按时间和状态筛、规则册能查、注入三改**（不改数据格式，旧数据零迁移）。
   ①**检索查询参数（B-76③）**：`memory_search` 加 `since`/`until`/`status`/`kind`/`layers`——按时间窗、按三态（做过/没做成/听说）、按多层组合筛；`kind=rule` 直接查规则册；空结果会说清是哪个过滤条件挡的。
