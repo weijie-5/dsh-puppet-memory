@@ -179,6 +179,21 @@ try {
   const t6 = (decision6?.messages || []).map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || ""))).join(String.fromCharCode(10));
   ok("六层注入块压着也能找到他那句话", t6.includes("<puppet_cue>"), t6.slice(0, 100));
 
+  // ---- A-101：宿主的「Current runtime context…」英文块也是一条普通 user/message，会抢在他前面
+  const agent8 = { session: { header: { id: "cue-s8", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
+  const decision8 = await preStep(
+    { agent: agent8 },
+    async () => ({
+      kind: "enter",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "邮件那件事你还记得吗" }] },
+        { role: "user", content: [{ type: "text", text: "Current runtime context. This snapshot supersedes earlier ones. Browser time zone for this request: Asia/Shanghai." }] },
+      ],
+    }),
+  );
+  const t8 = (decision8?.messages || []).map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || ""))).join(String.fromCharCode(10));
+  ok("英文上下文块不会顶掉他的话", t8.includes("<puppet_cue>"), t8.slice(0, 120));
+
   // ---- A-100：宿主有时用**空 messages** 调 pre-step → 回落到上次看到的话，且同一句不重复抛
   const agent7 = { session: { header: { id: "cue-s7", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
   const run7 = async (msgs) => {

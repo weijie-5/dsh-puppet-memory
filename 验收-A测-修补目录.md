@@ -112,6 +112,7 @@
 | A-98 | 实机又整轮没取词（`diag` 连记两次「取词跳过：这一轮没扫到可用的用户发言」）：注入消息不止一两条——core/rules/state/handoff/recall/cue 会连着追加**好几条**，A-96 只往回看 4 条，他的话被压到第 5 条以外，就全被剥成空串了 | 〔接口〕 | `recentUserTexts` 重写：最多往回扫 40 条，跳过 `source.kind=plugin:*`，**并且**一律 `stripInjected`、剥完为空就丢掉，凑够 2 段为止；调用处不再自己 map/filter | `test/inject-cue.mjs` 29 项（新增：六层注入块压着也能找到他那句话）；49 套全绿 | `git revert` |
 | A-99 | 数据链只有「成败」，没有分母和分母的成分：事件行不记**置信度**、也不记**候选从哪来**，`memory_cue stats` 只报条数——沉默率、平均置信度、事件/重要/常规各占多少全算不出来，调参只能靠体感 | 〔数据〕 | `recordEvent` 增 `confidence`/`sources`（important/event/normal 三条腿各几条）；`stats()` 聚最近 500 条事件：`proposed`（提出次数）、`verdicts` 四分类、`silentRate`、`avgConfidence`、`sourceMix`；`memory_cue stats` 输出加两行「数据链」「来源构成」 | `test/cueprompt.mjs` 73 项（事件记下置信度、来源构成、统计能算平均置信度、统计带数据链）；49 套全绿 | `git revert`；旧事件没有这两个字段，聚合时按 0/null 跳过 |
 | A-100 | 取词继续整轮空转，诊断终于给出答案：宿主有些 pre-step 调用里 **`messages` 是空数组**（`0 条`）——我们那些注入块就是在这种调用里被塞进去的。空列表里当然找不到他的话，A-98 的「往回扫」也就无从扫起 | 〔接口〕 | 每会话记「上次真正看到的话」到 `state/cue-last-seen.json`（5 分钟内有效）：`messages` 为空时回落到它；同时记「已为哪句话抛过」（`cueKey`），防止回落导致同一句重复抛；取词被门槛挡下时也留一行日志 | `test/inject-cue.mjs` 32 项（新增：有他的话时正常抛、空 messages 回落且不重复抛、回落有落盘）；49 套全绿 | `git revert`；`state/cue-last-seen.json` 可直接删，删了只是回落失效 |
+| A-101 | 取词继续空转，但这次日志说话了：`取词跳过：没有可取的二字词（Current runtime …）`——宿主的「Current runtime context…」**英文上下文块也是一条普通 user/message**，插在他的真发言后面，于是成了 `texts[0]`，中文二字词一个都没有，门槛直接判死 | 〔接口〕 | `recentUserTexts` 里加一条：**没有中文二字词的段落一律不当作「他的话」**（`bigramsOf(t).length === 0` 就跳过）。记忆是中文的，英文上下文块本来也不可能和它构成回忆 | `test/inject-cue.mjs` 33 项（新增：英文上下文块不会顶掉他的话）；49 套全绿 | `git revert` |
 
 ## 回滚通用规则
 

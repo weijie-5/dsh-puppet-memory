@@ -2836,6 +2836,10 @@ function recentUserTexts(messages = [], n = 2, maxScan = 40) {
         : "";
     const t = stripInjected(raw);
     if (!String(t || "").trim()) continue;
+    // 宿主还会把「Current runtime context…」这类**英文上下文块**当成一条普通 user/message 塞进来
+    // （A-101 实机：它抢在真发言之前，成了 texts[0]，取词直接判「没有可取的二字词」）。
+    // 我们的记忆是中文的，没有中文二字词的段落一律不当作「他的话」。
+    if (!bigramsOf(t).length) continue;
     out.push(t);
   }
   return out;
