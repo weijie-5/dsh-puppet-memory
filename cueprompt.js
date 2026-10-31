@@ -16,7 +16,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { matchScore, termsOf } from "./words.js";
+import { matchScore, sharedTerms, termsOf } from "./words.js";
 
 const DAY = 86400000;
 const MISRECALL_TTL = 30 * DAY;
@@ -233,9 +233,12 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
    * @param {{userText:string, searchFn?:Function, limit?:number}} opts
    * @returns {{candidates:Array<{hash:string,text:string,where:string,kind:string,importantId?:string}>, blocked:number, fromImportant:number, fromNormal:number}}
    */
-  function pickCandidates({ userText, searchFn = null, limit = 7 } = {}) {
+  function pickCandidates({ userText, searchFn = null, limit = 7, minSharedTerms = 1 } = {}) {
     const userTerms = new Set(termsOf(userText));
     const grams = userTerms; // 兼容旧命名（下面还有分支在用）
+    // 触发门槛（丹阳 2026-10-31：「让触发方式是两个匹配的词就行」）：至少 N 个不同的词同时命中，
+    // 默认 1（保持原行为）；设 2 就等于「两个词都对上才算」，单靠一个弱词不会抛回忆。
+    const need = Math.max(1, Math.min(6, Number(minSharedTerms) || 1));
     const blocked = misrecallSet();
     const out = [];
     let blockedCount = 0;
@@ -260,6 +263,7 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
         if (!String(g.summary || "").trim()) continue;
         // 按「词表命中的词按字数 + 弱二字词」计分，≥4 才算真重合（丹阳 2026-10-29：分词之后别再按字数硬套）
         if (matchScore(userText, text) < 4) continue;
+        if (need > 1 && sharedTerms(userText, text) < need) continue;
         taken += 1;
         out.push({
           hash: `ev:${g.key}`,
@@ -275,8 +279,8 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
     for (const imp of importantAll()) {
       if (String(imp.state || "active") !== "active") continue;
       const words = termsOf(`${imp.topic || ""} ${(imp.refs || []).join(" ")}`);
-      const shared = words.some((g) => userTerms.has(g));
-      if (!shared) continue;
+      const sharedN = [...new Set(words)].filter((g) => userTerms.has(g)).length;
+      if (sharedN < need) continue;
       if ((imp.refs || []).some((h) => isBlocked(h, imp.topic, blocked))) {
         blockedCount += 1;
         continue;
@@ -304,6 +308,7 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
         if (out.length >= limit) break;
         if (!h || !h.hash) continue;
         if (out.some((c) => c.hash === h.hash)) continue;
+        if (need > 1 && sharedTerms(userText, String(h.text || "")) < need) continue;
         if (isBlocked(h.hash, "", blocked)) {
           blockedCount += 1;
           continue;
@@ -312,7 +317,8 @@ export function createCuePrompter({ memDir, now = () => Date.now() } = {}) {
       }
     }
     // ④ 重要库兜底：常规也空 → 再扫一遍重要（丹阳 2026-10-29：「可以再取」）
-    if (!out.length) {
+    //    need>1 是「两个词都对上才算」的严格档，不再兜底（兜底正是靠单字/单词进去的）
+    if (!out.length && need <= 1) {
       for (const imp of importantAll()) {
         if (String(imp.state || "active") !== "active") continue;
         out.push({

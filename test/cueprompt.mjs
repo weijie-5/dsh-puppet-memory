@@ -96,6 +96,21 @@ try {
   const picked4 = cp.pickCandidates({ userText: "随便一句话完全不相干", searchFn: noHits, limit: 5 });
   ok("常规 0 结果时回扫重要库", picked4.candidates.length > 0 && picked4.candidates.every((c) => c.kind === "important"), JSON.stringify(picked4.candidates.map((c) => c.kind)));
 
+  // ---- 4b. 触发门槛 minSharedTerms（2026-10-31 丹阳：「让触发方式是两个匹配的词就行」）
+  writeJsonl("deep/important.jsonl", [
+    { id: "imp-one", topic: "高峰价贵就先记着", refs: ["h-price"], evidence: "他说高峰价贵就攒着等谷价", count: 2, fails: 0, state: "active" },
+    { id: "imp-two", topic: "高峰价贵 谷价一起做", refs: ["h-price2"], evidence: "高峰 谷价 两件事一起做", count: 2, fails: 0, state: "active" },
+  ]);
+  const twoWordText = "高峰价贵的话，那个谷价一起做吗";
+  const loose = cp.pickCandidates({ userText: twoWordText, searchFn: noHits, limit: 6 });
+  ok("默认门槛（1 个词）会取出单关键词条目", loose.candidates.some((c) => c.importantId === "imp-one"));
+  const strict = cp.pickCandidates({ userText: twoWordText, searchFn: noHits, limit: 6, minSharedTerms: 2 });
+  ok("门槛=2 时单关键词条目被挡", !strict.candidates.some((c) => c.importantId === "imp-one"), JSON.stringify(strict.candidates.map((c) => c.importantId)));
+  ok("门槛=2 时两词都命中的条目仍然取到", strict.candidates.some((c) => c.importantId === "imp-two"), JSON.stringify(strict.candidates.map((c) => c.importantId)));
+  ok("门槛=2 不再走重要库兜底", strict.candidates.every((c) => c.kind === "important"), JSON.stringify(strict.candidates.map((c) => c.kind)));
+  const strictNote = cp.pickCandidates({ userText: twoWordText, searchFn: () => [{ hash: "h-x", text: "只提到高峰这一件事", where: "notes" }], limit: 6, minSharedTerms: 2 });
+  ok("门槛=2 时常规库单关键词也不进", !strictNote.candidates.some((c) => c.hash === "h-x"));
+
   // ---- 5. 提词器判定
   const cand = picked.candidates;
   const good = await cp.judge({ userText: "邮件那件事", candidates: cand, callModel: async () => '{"pick":1,"hint":"他提过邮件被批两次","question":""}' });

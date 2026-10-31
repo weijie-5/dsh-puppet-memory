@@ -48,6 +48,16 @@ ok("关的时候提示里说清「不调模型」", /不调模型/.test(String(o
 const empty = updateCuePrompt({});
 ok("空 patch 拒绝（不写半份配置）", empty.ok === false, JSON.stringify(empty));
 
+// 触发门槛 minSharedTerms（2026-10-31）
+const strictOn = updateCuePrompt({ minSharedTerms: 2 });
+ok("能设成两个词才算", strictOn.ok === true && strictOn.minSharedTerms === 2, JSON.stringify(strictOn));
+ok("门槛落盘", JSON.parse(fs.readFileSync(path.join(TMP, "config.json"), "utf8")).cueprompt.minSharedTerms === 2);
+const badNeed = updateCuePrompt({ minSharedTerms: 9 });
+ok("越界门槛整次拒绝", badNeed.ok === false && /1–6|1-6/.test(String(badNeed.error)), JSON.stringify(badNeed));
+ok("被拒后门槛没被写坏", cuepromptView().minSharedTerms === 2, JSON.stringify(cuepromptView()));
+const backLoose = updateCuePrompt({ minSharedTerms: 1 });
+ok("能调回默认 1", backLoose.ok === true && backLoose.minSharedTerms === 1);
+
 fs.rmSync(TMP, { recursive: true, force: true });
 if (fails.length) {
   console.log(`❌ cueprompt-api：${pass} 过，${fails.length} 失败`);
