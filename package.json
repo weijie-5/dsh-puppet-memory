@@ -16,6 +16,7 @@
     "cueprompt.js",
     "words.js",
     "words-dict.json",
+    "cloudbackup.js",
     "client.js",
     "social.js",
     "state.js",

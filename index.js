@@ -38,6 +38,7 @@ import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPat
 import { createSearchIndex, sqliteAvailable, sqliteUnavailableReason } from "./searchindex.js";
 import { bigramsOf, createCuePrompter, selfEchoOf, stripInjected, verdictOf, worthCueing } from "./cueprompt.js";
 import { createRules, formatRuleRow, parseRulesMarkdown, rulesDefaults } from "./rules.js";
+import { createCloudBackup, defaultCloudDir, listCloudPacks, pruneCloudPacks, verifyCloudBackup } from "./cloudbackup.js";
 
 const PLUGIN_NAME = "dsh-puppet-memory";
 const DISPLAY_NAME = "木偶记忆";
@@ -601,6 +602,16 @@ function defaultConfig() {
       config: true,
       minIntervalHours: 24,
       keepDays: 30,
+      // 云盘加密包（v0.39.0，2026-10-30 丹阳：备份到指定文件夹，开百度网盘就自动同步）
+      // 与上面的本地快照互补：本地快照防手滑，云包防整机/整盘丢失。
+      // 密码**不落盘**：只从调用参数或环境变量 DSH_MEMORY_BACKUP_PASS 读。
+      cloud: {
+        enabled: false,
+        dir: "", // 空 = 自动选百度网盘同步目录（F:\BaiduSyncdisk\dsh-memory-cloud）
+        includeSessions: false, // 会话原文涉隐私，默认不含
+        includeAssets: true,
+        keepPacks: 6,
+      },
     },
     sessions: { disabled: [] },
     // v0.35（B-67）：回合日记是否连全文一起存。
@@ -682,6 +693,7 @@ function loadConfig() {
   merged.inject = { ...defaultConfig().inject, ...(cfg.inject || {}) };
   merged.inject.core = { ...defaultConfig().inject.core, ...((cfg.inject && cfg.inject.core) || {}) };
   merged.backup = { ...defaultConfig().backup, ...(cfg.backup || {}) };
+  merged.backup.cloud = { ...defaultConfig().backup.cloud, ...((cfg.backup && cfg.backup.cloud) || {}) };
   merged.sessions = { ...defaultConfig().sessions, ...(cfg.sessions || {}) };
   merged.autoSummary = { ...defaultConfig().autoSummary, ...(cfg.autoSummary || {}) };
   merged.facts = { ...defaultConfig().facts, ...(cfg.facts || {}) };
@@ -1689,6 +1701,72 @@ function backupAsync(reason) {
   setTimeout(() => {
     safe("异步备份", () => backupNow(reason), "");
   }, 1500);
+}
+
+// ---------------------------------------------------------------------------
+// 云盘加密包（v0.39.0）：本地快照之外的「异地」那份。
+// 本地快照防手滑（改错/误删能回滚），云包防整机/整盘丢（F 盘坏了本地快照一起没）。
+// 目标目录默认落在百度网盘同步目录里，网盘客户端一开就自动上传。
+// ---------------------------------------------------------------------------
+function cloudBackupDir(cloud = {}) {
+  const wanted = String(cloud.dir || "").trim();
+  if (wanted) return wanted;
+  return defaultCloudDir();
+}
+
+function cloudPacksOf(dir) {
+  return listCloudPacks(dir);
+}
+
+function cloudBackupStats(cloud = {}) {
+  const dir = cloudBackupDir(cloud);
+  const packs = cloudPacksOf(dir);
+  let ledger = 0;
+  try {
+    ledger = fs.readFileSync(path.join(dir, "backup-ledger.jsonl"), "utf8").split("\n").filter(Boolean).length;
+  } catch {
+    /* 没有台账 */
+  }
+  return {
+    dir,
+    packs: packs.length,
+    latest: packs[0]?.name || "",
+    latestAt: packs[0]?.mtime || 0,
+    totalBytes: packs.reduce((n, p) => n + p.bytes, 0),
+    ledger,
+  };
+}
+
+function cloudBackupNow(options = {}) {
+  const cfg = loadConfig();
+  const cloud = (cfg.backup && cfg.backup.cloud) || {};
+  const password = String(options.password || process.env.DSH_MEMORY_BACKUP_PASS || "");
+  if (!password) {
+    return "云备份需要密码（密码不落盘，插在哪都行就是不能写进配置）：先把环境变量 DSH_MEMORY_BACKUP_PASS 设好，或调用时传 password 参数。";
+  }
+  const dir = String(options.dir || "").trim() || cloudBackupDir(cloud);
+  const includeSessions = options.sessions !== undefined ? Boolean(options.sessions) : cloud.includeSessions === true;
+  const includeAssets = options.assets !== undefined ? Boolean(options.assets) : cloud.includeAssets !== false;
+  const res = createCloudBackup({ memDir: MEM_DIR, dshDir: DSH_DIR, outDir: dir, password, includeSessions, includeAssets });
+  if (!res.ok) return `云备份失败：${res.skipped || "未知原因"}`;
+  const removed = pruneCloudPacks(dir, Number(options.keepPacks || cloud.keepPacks) || 6);
+  try {
+    const state = loadState();
+    state.lastCloudBackupAt = new Date().toISOString();
+    state.lastCloudBackupFile = path.basename(res.file);
+    saveState(state);
+  } catch {
+    /* 状态写不进不影响包 */
+  }
+  log("info", `云备份：${path.basename(res.file)}（${(res.bytes / 1048576).toFixed(1)} MB / ${res.entries} 个文件）→ ${dir}`);
+  const lines = [
+    `云备份完成：${res.file}`,
+    `  包大小 ${(res.bytes / 1048576).toFixed(1)} MB（明文 ${(res.plainBytes / 1048576).toFixed(1)} MB，${res.entries} 个文件）`,
+    `  sha256 ${res.sha256}`,
+    `  目录 ${dir}${removed.length ? `（旧包已清理 ${removed.length} 个）` : ""}`,
+    "  网盘客户端开着就会自动上传；密码没写进任何文件，丢了打不开包，自己留好。",
+  ];
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -6801,7 +6879,7 @@ function apply(ctx) {
 
       name: "memory_write",
       description:
-        "写入一条长期记忆。layer=relation（关键词-释义对，如称呼/爱好/旧账，每轮注入，常用的放这里）| user（用户档案：兴趣爱好、习惯、背景资料等，不常注入，需要时用 memory_search layer=user 查）| memo（便签：工作交接、临时草稿，可随时清空）| note（临时笔记）| saying（常言/口头禅的细节解释）| persona（人设设定）| diary（日记条目）。重要的事一定要写进来，否则下次会话不会记得。出处：source 记「谁说的/在哪看到的」（如「UP主@BV号」），quote 标原文（verbatim）还是转述（paraphrase）；找不到出处就留空，不编造。images/audios 可带本地图片或音频路径（音频支持 mp3/wav/m4a/aac/ogg/opus/flac/webm/amr），一起存进记忆资产库（适合人物设定、截图、示意图、语音片段），带 source 时会顺手登记资产出处。tags 可给条目打分类标签（除 persona 外都支持，更新时旧标签自动保留合并；写 -标签 表示删除该标签），只接受固定词表，词表外会被忽略。梗/口头禅/网络传说类请用 saying 层，关系层只放人和关系。diary 可加 important=true 标重要事件。note 可写备注（跟条目一起落盘并写进 guide 索引）；state 标记这条记忆的可信状态（做过 / 没做成 / 听说，配 proof 写依据），不标就是不标；计划/承诺类给 until（到期时间），到点会被到期提醒推一次；写入返回里的 hash 可用 memory_locate 定位原文。之后用 memory_search 的 tag 参数按标签查。",
+        "写入一条长期记忆。layer=relation（关键词-释义对，如称呼/爱好/旧账，每轮注入，常用的放这里）| user（用户档案：兴趣爱好、习惯、背景资料等，不常注入，需要时用 memory_search layer=user 查）| memo（便签：工作交接、临时草稿，可随时清空）| note（临时笔记）| saying（常言/口头禅的细节解释）| persona（人设设定）| diary（日记条目）。重要的事一定要写进来，否则下次会话不会记得。出处：source 记「谁说的/在哪看到的」（如「UP主@BV号」），quote 标原文（verbatim）还是转述（paraphrase）；找不到出处就留空，不编造。images/audios 可带本地图片或音频路径（音频支持 mp3/wav/m4a/aac/ogg/opus/flac/webm/amr），一起存进记忆资产库（适合人物设定、截图、示意图、语音片段），带 source 时会顺手登记资产出处。tags 可给条目打分类标签（除 persona 外都支持，更新时旧标签自动保留合并；写 -标签 表示删除该标签），只接受固定词表，词表外会被忽略。梗/口头禅/网络传说类请用 saying 层，关系层只放人和关系。diary 可加 important=true 标重要事件。note 可写备注（跟条目一起落盘并写进 guide 索引）；state 标记这条记忆的可信状态（做过 / 没做成 / 听说，配 proof 写依据），不标就是不标；计划/承诺类给 until（到期时间），到点会被到期提醒推一次；写入返回里的 hash 可用 memory_locate 定位原文。之后用 memory_search 的 tag 参数按标签查。【使用规则】不编造：没有证据的结论不要写成事实——标 `state=heard` 并写清 proof（谁说的/在哪看到的）；出处栏找不到就留空，绝不编。",
       parameters: {
         type: "object",
         properties: {
@@ -6963,7 +7041,7 @@ function apply(ctx) {
 
       name: "memory_rules",
       description:
-        "规则册（deep/workbook/10-规则册.md）的只读视图：action=list 列条目（默认只列生效）、action=get 按编号看一条全文（如 R-12）、action=search 按关键词查。规则册 md 是唯一源，这里读的是派生索引 deep/rules.jsonl（md 变了自动重建，只读不改 md）。",
+        "规则册（deep/workbook/10-规则册.md）的只读视图：action=list 列条目（默认只列生效）、action=get 按编号看一条全文（如 R-12）、action=search 按关键词查。规则册 md 是唯一源，这里读的是派生索引 deep/rules.jsonl（md 变了自动重建，只读不改 md）。v0.39.0 起支持「规则绑定插件」：规则行里写 〔绑定：bili〕 后，只有对应工具（名前缀匹配，如 bili_* / qq_*）启用时才会出现在 list/search 里；想看全部传 all=true。",
       parameters: {
         type: "object",
         properties: {
@@ -6972,6 +7050,7 @@ function apply(ctx) {
           query: { type: "string", description: "action=search 用：关键词" },
           level: { type: "string", description: "action=list 用：只列某区（M / N / R / P / X）" },
           state: { type: "string", description: "action=list 用：只看某个状态（生效 / 暂停 / 失效）；默认只列生效" },
+          all: { type: "boolean", description: "连「绑定了当前没启用的插件」的规则一起列（默认隐藏）" },
           limit: { type: "number", description: "最多几条，默认 50" },
         },
       },
@@ -6983,14 +7062,29 @@ function apply(ctx) {
           const rows = engine.all();
           if (engine.errorOf()) return engine.errorOf();
           if (!rows.length) return "规则册还没数据化：读不到 deep/workbook/10-规则册.md。";
+          const all = args?.all === true;
+          // 当前可用工具名（绑定规则的可见性靠它判断；拿不到工具表就当全部可用，宁可多列）
+          const isActive = (() => {
+            let names = null;
+            try {
+              names = (ctx.tools?.schemas?.() || []).map((s) => String(s?.name || "").toLowerCase());
+            } catch {
+              names = null;
+            }
+            if (!names || !names.length) return null;
+            return (bind) => names.some((n) => n.startsWith(String(bind || "").toLowerCase()));
+          })();
           if (action === "get") {
             const row = engine.get(args?.id);
             if (!row) return `规则册里没有「${args?.id}」。用 action=list 看有哪些编号。`;
+            const bound = Array.isArray(row.bind) && row.bind.length;
+            const active = !bound || !isActive || isActive(row.bind[0]);
             const lines = [
               `${row.id}${row.state === "生效" ? "" : `〔${row.state}〕`} ${row.title}`,
               `分区：${row.section || "-"}　状态：${row.state}${row.decidedAt ? `　日期：${row.decidedAt}` : ""}`,
               "规则：" + row.body,
             ];
+            if (bound) lines.push(`绑定：${row.bind.join(" / ")}（${active ? "工具已启用" : "工具当前未启用"}）`);
             if (row.source) lines.push("出处：" + row.source);
             if (row.why) lines.push("为什么：" + row.why);
             lines.push(`行号：第 ${row.line} 行`);
@@ -6999,16 +7093,21 @@ function apply(ctx) {
           if (action === "search") {
             const q = String(args?.query || "").trim();
             if (!q) return "action=search 需要 query。";
-            const res = engine.search(q);
-            if (!res.rows.length) return `规则册里没有匹配「${q}」的条目（共 ${rows.length} 条）。`;
+            const res = engine.search(q, { isActive, all });
+            if (!res.rows.length) {
+              const hid = res.hidden ? `（另有 ${res.hidden} 条绑定规则因工具未启用被隐藏，all=true 可看）` : "";
+              return `规则册里没有匹配「${q}」的条目（共 ${rows.length} 条）${hid}。`;
+            }
             const max = Math.max(1, Math.min(100, Number(args?.limit) || 20));
-            return res.rows.slice(0, max).map(formatRuleRow).join("\n");
+            const hid = res.hidden ? `\n…另有 ${res.hidden} 条绑定规则因工具未启用被隐藏（all=true 可看）` : "";
+            return res.rows.slice(0, max).map(formatRuleRow).join("\n") + hid;
           }
           const active = rows.filter((r) => r.state === "生效").length;
-          const res = engine.list({ level: args?.level, state: args?.state, limit: args?.limit });
-          if (!res.rows.length) return `没有符合条件的规则条目（共 ${rows.length} 条，生效 ${active} 条）。`;
+          const res = engine.list({ level: args?.level, state: args?.state, limit: args?.limit, isActive, all });
+          const hid = res.hidden ? `，另 ${res.hidden} 条绑定规则因工具未启用隐藏（all=true 看）` : "";
+          if (!res.rows.length) return `没有符合条件的规则条目（共 ${rows.length} 条，生效 ${active} 条${hid}）。`;
           const more = res.total > res.rows.length ? `\n…还有 ${res.total - res.rows.length} 条，用 level/state/limit 缩小` : "";
-          return `规则册（共 ${rows.length} 条，生效 ${active} 条）\n${res.rows.map(formatRuleRow).join("\n")}${more}`;
+          return `规则册（共 ${rows.length} 条，生效 ${active} 条${hid}）\n${res.rows.map(formatRuleRow).join("\n")}${more}`;
         } catch (err) {
           return `读规则册失败：${err?.message || err}`;
         }
@@ -7118,7 +7217,7 @@ function apply(ctx) {
 
       name: "memory_void",
       description:
-        "把一条记忆标记为「已作废」——**不删数据、可恢复**。用途：旧结论被推翻、记错了、过期了、来源不成立。标废后：①不再进每轮注入；②memory_search 默认不返回；③memory_locate 仍能按 hash 查到原文和作废原因；④guide 索引保留。**reason 必填**（否则等于无声删除，以后查不回来）。action=unvoid 撤销。要真正删数据请手工改库，这个工具永远不删。",
+        "把一条记忆标记为「已作废」——**不删数据、可恢复**。用途：旧结论被推翻、记错了、过期了、来源不成立。标废后：①不再进每轮注入；②memory_search 默认不返回；③memory_locate 仍能按 hash 查到原文和作废原因；④guide 索引保留。**reason 必填**（否则等于无声删除，以后查不回来）。action=unvoid 撤销。要真正删数据请手工改库，这个工具永远不删。【使用规则】作废是不可逆面：先确认作废哪一条、reason 写清为什么（「以后可能还想不起来」不够，要写结论被什么推翻/哪来的证据）；拿不准就先问。",
       parameters: {
         type: "object",
         properties: {
@@ -7310,7 +7409,7 @@ function apply(ctx) {
     register({
       name: "memory_forget",
       description:
-        "会话记忆管理（v0.28）：管「当前会话」的记忆片段，避免脏记忆每轮污染上下文（坏记忆进了注入会跟着每个 turn 走）。action=list 看本会话产生的片段（turn 日记 / 自动摘要）和当前屏蔽表 | suppress 把条目加进本会话屏蔽（hashes=[...]；也可以传 core/state/social/persona 屏蔽整块）| unsuppress 解除屏蔽（hashes 省略=全部）| delete 真删本会话的一条（hash=…，删前自动归档到 behavior/archive，可找回）| overview 看状态。session 省略时用当前会话。屏蔽只影响注入，不动数据。",
+        "会话记忆管理（v0.28）：管「当前会话」的记忆片段，避免脏记忆每轮污染上下文（坏记忆进了注入会跟着每个 turn 走）。action=list 看本会话产生的片段（turn 日记 / 自动摘要）和当前屏蔽表 | suppress 把条目加进本会话屏蔽（hashes=[...]；也可以传 core/state/social/persona 屏蔽整块）| unsuppress 解除屏蔽（hashes 省略=全部）| delete 真删本会话的一条（hash=…，删前自动归档到 behavior/archive，可找回）| overview 看状态。session 省略时用当前会话。屏蔽只影响注入，不动数据。【使用规则】delete 属于不可逆面：先说出删的是哪一条、为什么删，并确认后再动手；能屏蔽就别删（屏蔽可撤销）。",
       parameters: {
         type: "object",
         properties: {
@@ -7513,12 +7612,23 @@ function apply(ctx) {
 
       name: "memory_backup",
       description:
-        "立刻把记忆备份到 F 盘（深层、阵列、行为记忆、图片/音频资产、配置与运行态、原始会话）。自动备份一天最多一次、只保留 30 天；手动调用不受频率限制，也不会被清理策略拦。自动备份的频率/保留天数/是否含行为记忆，可在 Web UI「设置 → 记忆备份」面板里点选，等价于改 config.json 的 backup 段。",
-      parameters: { type: "object", properties: {} },
+        "立刻把记忆备份到 F 盘（深层、阵列、行为记忆、图片/音频资产、配置与运行态、原始会话）。自动备份一天最多一次、只保留 30 天；手动调用不受频率限制，也不会被清理策略拦。自动备份的频率/保留天数/是否含行为记忆，可在 Web UI「设置 → 记忆备份」面板里点选，等价于改 config.json 的 backup 段。mode=cloud 时改为生成**加密云包**（AES-256-GCM）写进指定文件夹（默认百度网盘同步目录 F:\\BaiduSyncdisk\\dsh-memory-cloud），网盘客户端一开就自动上传；云备份的密码不落盘，只读参数 password 或环境变量 DSH_MEMORY_BACKUP_PASS。【使用规则】密码绝不写进配置、脚本、文档或记忆；恢复时先解到独立目录、核对 sha256，确认后再人工覆盖记忆库（不要直接解到原位）。",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["local", "cloud"], description: "local=本机快照（默认）；cloud=加密云包" },
+          password: { type: "string", description: "cloud 用：加密密码（会出现在调用记录里，更安全的做法是设 DSH_MEMORY_BACKUP_PASS 环境变量）" },
+          dir: { type: "string", description: "cloud 用：输出目录（默认百度网盘同步目录；也可指定别的文件夹）" },
+          sessions: { type: "boolean", description: "cloud 用：是否含会话原文（默认不含，含了包大很多且涉隐私）" },
+          assets: { type: "boolean", description: "cloud 用：是否含图片/音频资产（默认含）" },
+          keepPacks: { type: "number", description: "cloud 用：目录里保留几个包（默认 6，旧的自动删）" },
+        },
+      },
       output,
-      async execute() {
+      async execute(args) {
         try {
           ensureDirs();
+          if (String(args?.mode || "local") === "cloud") return cloudBackupNow(args || {});
           return backupNow("manual", { force: true });
         } catch (err) {
           return `备份失败：${err?.message || err}`;
@@ -7561,7 +7671,7 @@ function apply(ctx) {
     register({
 
       name: "memory_clear",
-      description: "清空便签（layer=memo）。清空前会把原便签归档到 behavior/archive/，不会直接丢内容。",
+      description: "清空便签（layer=memo）。清空前会把原便签归档到 behavior/archive/，不会直接丢内容。【使用规则】清空是不可逆面：他明确要清才清，不要自己顺手清。",
       parameters: {
         type: "object",
         properties: {
