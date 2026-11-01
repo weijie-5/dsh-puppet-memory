@@ -38,6 +38,7 @@ import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPat
 import { createSearchIndex, sqliteAvailable, sqliteUnavailableReason } from "./searchindex.js";
 import { bigramsOf, createCuePrompter, selfEchoOf, stripInjected, verdictOf, worthCueing } from "./cueprompt.js";
 import { createRules, formatRuleRow, parseRulesMarkdown, rulesDefaults } from "./rules.js";
+import { createGrants, formatGrantRow, grantOfEntry, grantsDefaults, grantsStats, GRANT_ACTIONS } from "./grants.js";
 import { createCloudBackup, defaultCloudDir, listCloudPacks, pruneCloudPacks, verifyCloudBackup } from "./cloudbackup.js";
 
 const PLUGIN_NAME = "dsh-puppet-memory";
@@ -3351,6 +3352,13 @@ let rulesSingleton = null;
 function rulesForSearch() {
   if (!rulesSingleton) rulesSingleton = createRules({ memDir: MEM_DIR });
   return rulesSingleton;
+}
+
+// v0.40（B-97）授权索引：只读派生，不拦任何动作
+let grantsSingleton = null;
+function grantsForSearch() {
+  if (!grantsSingleton) grantsSingleton = createGrants({ memDir: MEM_DIR });
+  return grantsSingleton;
 }
 
 const SEARCH_LAYERS = ["behavior", "deep", "array", "user", "memo"];
@@ -7272,6 +7280,88 @@ function apply(ctx) {
           return `规则册（共 ${rows.length} 条，生效 ${active} 条${hid}）\n${res.rows.map(formatRuleRow).join("\n")}${more}`;
         } catch (err) {
           return `读规则册失败：${err?.message || err}`;
+        }
+      },
+    });
+
+    // v0.40（B-97）：授权索引——只读，不拦任何动作。先看「如果按判据拦，会误伤多少」。
+    register({
+
+      name: "memory_grants",
+      description:
+        "记忆条目的授权索引（只读 observe 档，B-97）：把「这条记忆允许我做什么」按四条判据算出来——read 本地读取 / inject 进注入 / cite 对外引用 / share 原样发出。判据是确定性的：cite 要求有出处（source），share 还要求原文照抄（quote=verbatim）且不是听说（state≠heard）。action=list 列条目、check 按 hash/keyword 看一条的四项判定与理由、stats 看分布（多少条能引用、多少条没出处、标废几条）、shadow 看「影子记录」——真去拦之前先把本该拒绝的动作记在 deep/grants-shadow.jsonl 里，用来复盘误伤率。只读：不改任何记忆条目，只维护派生文件 deep/grants.jsonl。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "check", "stats", "shadow"], description: "默认 list" },
+          hash: { type: "string", description: "action=check 用：条目 hash（可只给前 8 位）" },
+          keyword: { type: "string", description: "action=check 用：按标题/关键词匹配" },
+          kind: { type: "string", description: "action=list 用：只列某个 kind（relation / note / diary / saying / user / memo）" },
+          layer: { type: "string", description: "action=list 用：只列某层（behavior / deep / user / memo）" },
+          audience: { type: "string", enum: ["self", "owner"], description: "action=list 用：读者范围" },
+          grantAction: { type: "string", enum: GRANT_ACTIONS, description: "action=list 用：只看某一动作有判定的条目" },
+          onlyDenied: { type: "boolean", description: "action=list 用：只看至少有一项被拒的" },
+          limit: { type: "number", description: "最多几条，默认 20" },
+        },
+      },
+      output,
+      async execute(args) {
+        try {
+          const engine = grantsForSearch();
+          const action = String(args?.action || "list");
+          if (action === "check") {
+            const rows = engine.find({ hash: args?.hash, keyword: args?.keyword });
+            if (!rows.length) return "没找到匹配的条目（hash 或 keyword 给对了吗？只覆盖 behavior/deep/user/memo 的真条目，不含索引行）。";
+            const row = rows[0];
+            const aud = row.audience === "self" ? "仅自己" : "主人";
+            const lines = [
+              `${row.short} 〔${row.kind || "?"}·${aud}〕 ${row.title || "(无标题)"}`,
+              `出处：${row.basis.source || "（无）"}　口径：${row.basis.quote || "（未标）"}　状态：${row.basis.state || "（未标）"}`,
+              "—— 四个动作 ——",
+              ...GRANT_ACTIONS.map((a) => `${a}: ${row.actions[a].allow ? "允许" : "拒绝"}　${row.actions[a].reason}`),
+            ];
+            return lines.join("\n");
+          }
+          if (action === "stats") {
+            const s = engine.stats();
+            if (!s.total) return "授权索引是空的：索引里没有可判定的条目。";
+            const kinds = Object.entries(s.byKind)
+              .sort((a, b) => b[1] - a[1])
+              .map(([k, n]) => `${k} ${n}`)
+              .join(" / ");
+            const acts = GRANT_ACTIONS.map((a) => `${a} 允许 ${s.byAction[a].allow} / 拒 ${s.byAction[a].deny}`).join("；");
+            return [
+              `授权索引：${s.total} 条（派生文件 deep/grants.jsonl，只读）`,
+              `按 kind：${kinds}`,
+              `按动作：${acts}`,
+              `可对外引用 ${s.citePct}%；可原样发出 ${s.sharePct}%；没出处 ${s.noSource} 条（${s.noSourcePct}%）；标废 ${s.voided} 条`,
+              s.sharePct < 50 ? "→ 一半以上条目不能原样外发：判据偏严是预期的（有出处才是少数）；先看误伤再谈放宽。" : "",
+            ]
+              .filter(Boolean)
+              .join("\n");
+          }
+          if (action === "shadow") {
+            const s = engine.shadowStats();
+            if (!s.total) return `影子记录还是空的（${s.file}）：没有拦过任何动作，所以没有误伤可复盘。`;
+            const byAct = Object.entries(s.byAction)
+              .map(([a, n]) => `${a} ${n}`)
+              .join(" / ");
+            return `影子记录 ${s.total} 条：${byAct}
+文件：${s.file}`;
+          }
+          const res = engine.list({
+            kind: args?.kind,
+            layer: args?.layer,
+            audience: args?.audience,
+            action: args?.grantAction,
+            onlyDenied: args?.onlyDenied === true,
+            limit: args?.limit,
+          });
+          if (!res.total) return "没有符合条件的条目。";
+          const more = res.total > res.rows.length ? `\n…还有 ${res.total - res.rows.length} 条，用 kind/layer/limit 缩小` : "";
+          return `授权索引（${res.total} 条命中，只读）\n${res.rows.map(formatGrantRow).join("\n")}${more}`;
+        } catch (err) {
+          return `读授权索引失败：${err?.message || err}`;
         }
       },
     });

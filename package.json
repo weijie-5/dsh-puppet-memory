@@ -12,6 +12,7 @@
   "files": [
     "index.js",
     "rules.js",
+    "grants.js",
     "searchindex.js",
     "cueprompt.js",
     "words.js",
