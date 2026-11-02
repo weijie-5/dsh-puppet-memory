@@ -1433,6 +1433,92 @@ function collectDueEntries(nowMs) {
 // （这张表是生成物，用 python 的 lunardate 一次性算出 1997–2065，插件运行时只读它、不自己算农历。）
 // 生日「经过那一次」的机制：每次检查时，为每个农历条目补齐今年/明年/后年的阳历行 —— 走过一年就补一年，
 // 表里的农历日期不用人管；闰月按常规月算（农历九月的闰九月不另开一行）。
+// v0.40（B-99④）：开幕表的读写接口——一次性提醒也记在这里（丹阳 2026-11-02：「这个还能记一月后的一次性提醒，不用别的地方记了」）
+// 行的三种写法：
+//   ① 一次性：{date:"2026-12-05", label:"提醒他交电费", once:true}   ← 那天提示一次，过后自动删
+//   ② 每年同日：{date:"2027-01-01", label:"跨年", repeat:"yearly"}
+//   ③ 农历：{lunar:"09-16", label:"丹阳生日", note:"…", source:"…"}  ← 每年按 map 换算，自动补下一年的行
+function openingTablePath() {
+  return PATHS.opening;
+}
+
+function readOpeningRows() {
+  return readJsonl(openingTablePath()).filter((r) => r && typeof r === "object");
+}
+
+function writeOpeningRows(rows) {
+  writeJsonl(openingTablePath(), rows);
+}
+
+function openingHashOf(row) {
+  return sha1(`opening|${row.date || row.lunar || ""}|${row.label || ""}`).slice(0, 16);
+}
+
+/** 加一条（一次性提醒 / 每年 / 农历都走这里）。date 或 inDays 二选一；lunar 单独一种。 */
+function addOpeningRow({ date = "", inDays = 0, label = "", note = "", source = "", lunar = "", once = false, repeat = "", kind = "" } = {}) {
+  const name = String(label || "").trim();
+  if (!name) return { ok: false, error: "label 不能为空（这条要提醒什么）" };
+  const rows = readOpeningRows();
+  let iso = String(date || "").trim();
+  if (lunar) {
+    if (!/^\d{1,2}-\d{1,2}$/.test(String(lunar).trim())) return { ok: false, error: "lunar 要写成「月-日」，例如 09-16" };
+  } else if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) {
+    const days = Number(inDays) || 0;
+    const d = new Date();
+    d.setDate(d.getDate() + days);
+    const pad = (n) => String(n).padStart(2, "0");
+    iso = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+  const row = { hash: "", date: lunar ? "" : iso, label: name, kind: kind || (once ? "remind" : "event"), note: String(note || ""), source: String(source || ""), at: nowISO() };
+  if (lunar) row.lunar = String(lunar).trim();
+  if (once) row.once = true;
+  if (repeat) row.repeat = String(repeat);
+  if (!lunar) row.hash = openingHashOf(row);
+  const dup = rows.find((r) => r && ((row.hash && r.hash === row.hash) || (!row.hash && r.lunar === row.lunar && r.label === row.label)));
+  if (dup) return { ok: true, row: dup, existed: true };
+  rows.push(row);
+  safe("开幕表写入", () => writeOpeningRows(rows));
+  return { ok: true, row, existed: false };
+}
+
+/** 删一条：按 hash 前缀，或按 label 精确匹配 */
+function removeOpeningRow({ hash = "", label = "" } = {}) {
+  const rows = readOpeningRows();
+  const h = String(hash || "").trim().toLowerCase();
+  const lb = String(label || "").trim();
+  const keep = [];
+  const removed = [];
+  for (const r of rows) {
+    const hitHash = h && String(r.hash || "").toLowerCase().startsWith(h);
+    const hitLabel = lb && String(r.label || "") === lb;
+    if (hitHash || hitLabel) removed.push(r);
+    else keep.push(r);
+  }
+  if (!removed.length) return { ok: false, removed: 0 };
+  safe("开幕表删除", () => writeOpeningRows(keep));
+  return { ok: true, removed: removed.length };
+}
+
+/** 一次性行：过了那天就清掉；已经错过的（那天没开 DSH）最多留 30 天，等下一次注入补一句「错过了」。 */
+function pruneOpeningRows({ nowMs = Date.now() } = {}) {
+  const rows = readOpeningRows();
+  const d = new Date(nowMs);
+  const pad = (n) => String(n).padStart(2, "0");
+  const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const grace = new Date(d.getTime() - 30 * 86400000);
+  const graceIso = `${grace.getFullYear()}-${pad(grace.getMonth() + 1)}-${pad(grace.getDate())}`;
+  const keep = rows.filter((r) => {
+    if (r.repeat === "yearly" || r.lunar) return true;
+    const oneShot = r.once === true || r.kind === "remind" || r.kind === "event";
+    if (!oneShot) return true;
+    const day = String(r.date || "");
+    if (!day) return true;
+    return day >= graceIso; // 超过 30 天的一次性提醒不再留
+  });
+  if (keep.length !== rows.length) safe("开幕表清理", () => writeOpeningRows(keep));
+  return { pruned: rows.length - keep.length };
+}
+
 function ensureOpeningLunarRows({ persist = true, nowMs = Date.now() } = {}) {
   if (!fs.existsSync(PATHS.opening)) return { added: 0, pruned: 0 };
   let rows = readJsonl(PATHS.opening);
@@ -1486,11 +1572,17 @@ function buildOpeningInjection(cfg, { nowMs = Date.now(), persist = true } = {})
   const opt = Object.assign({ enabled: true, lookaheadDays: 7, maxItems: 5 }, cfg?.opening || {});
   if (opt.enabled === false) return "";
   if (!fs.existsSync(PATHS.opening)) return "";
-  if (persist) ensureOpeningLunarRows({ persist, nowMs });
+  if (persist) {
+    safe("开幕表维护", () => {
+      ensureOpeningLunarRows({ persist, nowMs });
+      pruneOpeningRows({ nowMs });
+    });
+  }
   const seenPath = path.join(PATHS.stateDir, "opening-seen.json");
   const pad = (n) => String(n).padStart(2, "0");
   const d = new Date(nowMs);
   const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const year = d.getFullYear();
   let seen = null;
   try {
     seen = readJson(seenPath, null);
@@ -1498,21 +1590,42 @@ function buildOpeningInjection(cfg, { nowMs = Date.now(), persist = true } = {})
     seen = null;
   }
   if (seen && String(seen.date || "") === today) return "";
-  const rows = readJsonl(PATHS.opening).filter((r) => r && !r.voided && /^\d{4}-\d{2}-\d{2}$/.test(String(r.date || "")));
+  const rows = readJsonl(PATHS.opening).filter((r) => r && !r.voided);
   if (!rows.length) return "";
   const dayMs = 86400000;
   const todayMs = new Date(`${today}T00:00:00`).getTime();
+  // 每年同日的行，把日期换到今年；一次性行用原日期
+  const dayOf = (r) => {
+    const raw = String(r.date || "");
+    if (r.repeat === "yearly" && /^\d{4}-\d{2}-\d{2}$/.test(raw)) return `${year}${raw.slice(4)}`;
+    return raw;
+  };
   const hits = [];
   for (const r of rows) {
-    const t = new Date(`${String(r.date)}T00:00:00`).getTime();
+    const day = dayOf(r);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+    const t = new Date(`${day}T00:00:00`).getTime();
     if (!Number.isFinite(t)) continue;
     const diff = Math.round((t - todayMs) / dayMs);
+    const oneShot = r.repeat !== "yearly" && !r.lunar && !r.date ? false : r.repeat !== "yearly" && !r.lunar;
     if (diff === 0) hits.push(`今天：${r.label}${r.note ? `（${clip(String(r.note), 60)}）` : ""}`);
-    else if (diff > 0 && diff <= Number(opt.lookaheadDays)) hits.push(`还有 ${diff} 天：${r.date} ${r.label}`);
+    else if (diff > 0 && diff <= Number(opt.lookaheadDays)) hits.push(`还有 ${diff} 天：${day} ${r.label}`);
+    else if (diff < 0 && diff >= -30 && oneShot) hits.push(`错过了 ${-diff} 天：${day} 的提醒：${r.label}${r.note ? `（${clip(String(r.note), 60)}）` : ""}`);
   }
   if (!hits.length) return "";
-  if (persist) safe("开幕表标记", () => writeJson(seenPath, { date: today, at: nowISO() }));
-  return ["<puppet_opening>", "开幕表（特殊日子，每天第一次打开时读一次；不是用户消息）：", ...hits.slice(0, Math.max(1, Number(opt.maxItems) || 5)), "</puppet_opening>"].join("\n");
+  if (persist) {
+    safe("开幕表标记", () => writeJson(seenPath, { date: today, at: nowISO() }));
+    // 已经提示过的一次性行（今天或已错过）从表里删掉——只提醒一次
+    safe("开幕表销账", () => {
+      const rest = readOpeningRows().filter((r) => {
+        if (r.repeat === "yearly" || r.lunar) return true;
+        const day = String(r.date || "");
+        return day > today; // 只留还没到的
+      });
+      writeOpeningRows(rest);
+    });
+  }
+  return ["<puppet_opening>", "开幕表（特殊日子 / 一次性提醒，每天第一次打开时读一次；不是用户消息）：", ...hits.slice(0, Math.max(1, Number(opt.maxItems) || 5)), "</puppet_opening>"].join("\n");
 }
 
 function buildDueInjection(cfg, { nowMs = Date.now(), persist = true } = {}) {
@@ -7601,6 +7714,66 @@ function apply(ctx) {
       },
     });
 
+    // v0.40（B-99④）：开幕表的读写口——一次性提醒（「一个月后提醒我 X」）也记这里，不再另找地方
+    register({
+
+      name: "memory_opening",
+      description:
+        "开幕表的读写口：一张「特殊日子 / 一次性提醒」表，每天第一次打开 DSH 时读一次（不是每轮注入）。两种用法：①一次性提醒——add 给 inDays（如 30，表示一个月后）或 date（YYYY-MM-DD），到那天提示一次、提示完自动删；②每年的事——add 给 repeat=yearly（阳历）或 lunar（如 09-16，农历，按换算表每年自动补下一年的行）。list 看全部待办、remove 按 hash 或 label 删。写进来的东西会进 deep 层检索，所以事后也搜得到（带 source 出处）。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "add", "remove"], description: "默认 list" },
+          label: { type: "string", description: "这件事叫什么（add 必填；remove 时按它精确匹配）" },
+          date: { type: "string", description: "add 用：阳历日期 YYYY-MM-DD" },
+          inDays: { type: "number", description: "add 用：从今天起 N 天后（如 30=一个月后）；给 date 时忽略" },
+          lunar: { type: "string", description: "add 用：农历「月-日」，如 09-16" },
+          repeat: { type: "string", enum: ["yearly"], description: "add 用：每年同日重复" },
+          note: { type: "string", description: "补充说明（会跟着提醒一起显示）" },
+          source: { type: "string", description: "出处：谁说的/依据什么（如「丹阳 2026-11-02 说」）" },
+          once: { type: "boolean", description: "add 用：一次性提醒（默认按一次性处理；加 repeat/lunar 才是长期的）" },
+          hash: { type: "string", description: "remove 用：条目 hash（可只给前 8 位）" },
+        },
+      },
+      output,
+      async execute(args) {
+        try {
+          const action = String(args?.action || "list");
+          if (action === "add") {
+            const res = addOpeningRow({
+              date: args?.date,
+              inDays: args?.inDays,
+              label: args?.label,
+              note: args?.note,
+              source: args?.source,
+              lunar: args?.lunar,
+              once: args?.once === true,
+              repeat: args?.repeat,
+            });
+            if (!res.ok) return `没写上：${res.error}`;
+            if (res.existed) return `这条已经在表里了，没重复写：${res.row.label}`;
+            const when = res.row.lunar ? `农历 ${res.row.lunar}（每年）` : `${res.row.date}${res.row.repeat === "yearly" ? "（每年）" : ""}`;
+            return `记进开幕表：${when} ${res.row.label}${res.row.once ? "（一次性，提示过就删）" : ""}`;
+          }
+          if (action === "remove") {
+            const res = removeOpeningRow({ hash: args?.hash, label: args?.label });
+            if (!res.ok) return "没找到要删的那条（hash 或 label 给对了吗？先 action=list 看看）";
+            return `删掉 ${res.removed} 条。`;
+          }
+          const rows = readOpeningRows();
+          if (!rows.length) return "开幕表是空的。要记东西就 add（一次性提醒用 inDays/date，每年的事用 repeat/lunar）。";
+          const lines = rows.map((r, i) => {
+            const when = r.lunar ? `农历 ${r.lunar}（每年）` : `${r.date || "?"}${r.repeat === "yearly" ? "（每年）" : ""}`;
+            const kind = r.once || r.kind === "remind" ? "一次性" : r.repeat === "yearly" || r.lunar ? "每年" : "一次性";
+            return `${r.hash ? `#${String(r.hash).slice(0, 8)} ` : `${i + 1}. `}${when} ${r.label}〔${kind}〕${r.note ? `　${clip(String(r.note), 50)}` : ""}${r.source ? `　〔出处：${clip(String(r.source), 40)}〕` : ""}`;
+          });
+          return `开幕表（${rows.length} 条）\n${lines.join("\n")}`;
+        } catch (err) {
+          return `读写开幕表失败：${err?.message || err}`;
+        }
+      },
+    });
+
     // v0.39（B-94）：取词器 / 提词器的干预面。只动 deep/ 下那三张表，不碰记忆本体。
     register({
 
@@ -8450,6 +8623,6 @@ const plugin = {
   apply,
 };
 
-export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
+export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, addOpeningRow, removeOpeningRow, readOpeningRows, pruneOpeningRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
 export default plugin;
 

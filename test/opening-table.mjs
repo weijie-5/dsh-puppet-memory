@@ -83,7 +83,33 @@ try {
   ok("memory_search 能搜到开幕表", found.includes("opening-table.jsonl"), found.slice(0, 160));
   ok("检索结果带出处", found.includes("出处"), found.slice(0, 220));
 
-  // 10) 文件缺失不崩
+  // 10) 一次性提醒：add(inDays) 写进去 → 到附近能提示 → 提示完自动删
+  writeTable([{ lunar: "09-16", label: "丹阳生日", kind: "birthday", source: "丹阳 2026-11-02 说的" }]);
+  const added = mod.addOpeningRow({ inDays: 30, label: "提醒他交电费", note: "月底前", source: "丹阳 2026-11-02 说的", once: true });
+  ok("add 一次性提醒成功", added.ok === true, JSON.stringify(added).slice(0, 120));
+  const addedDate = added.row.date;
+  const near = new Date(new Date(addedDate + "T09:00:00+08:00").getTime() - 5 * 86400000);
+  const nearIso = near.toISOString().slice(0, 10);
+  const tOne = String(mod.buildOpeningInjection(cfg, { nowMs: at(nearIso) }));
+  ok("一次性提醒进入窗口", tOne.includes("交电费"), tOne.slice(0, 160));
+  const stillThere = readTable().filter((r) => r.label === "提醒他交电费");
+  ok("只是预告时还留着（等当天）", stillThere.length === 1, JSON.stringify(stillThere).slice(0, 120));
+  const tDay = String(mod.buildOpeningInjection(cfg, { nowMs: at(addedDate) }));
+  ok("当天提示「今天」", tDay.includes("今天：提醒他交电费"), tDay.slice(0, 160));
+  ok("当天提示完才销账", readTable().filter((r) => r.label === "提醒他交电费").length === 0);
+
+  // 11) 每年同日：repeat=yearly 每年都能命中
+  writeTable([{ date: "2020-01-01", label: "跨年", repeat: "yearly" }]);
+  const tYear = String(mod.buildOpeningInjection(cfg, { nowMs: at("2027-01-01") }));
+  ok("每年同日能命中", tYear.includes("跨年"), tYear.slice(0, 120));
+
+  // 12) remove 按 label 删
+  writeTable([{ date: "2027-05-01", label: "可删的提醒", once: true }]);
+  const rm = mod.removeOpeningRow({ label: "可删的提醒" });
+  ok("remove 删除成功", rm.ok === true && rm.removed === 1, JSON.stringify(rm));
+  ok("删完表里没有了", readTable().length === 0, JSON.stringify(readTable()));
+
+  // 13) 文件缺失不崩
   fs.unlinkSync(TABLE);
   const t10 = String(mod.buildOpeningInjection(cfg, { nowMs: at("2027-10-15") }));
   ok("文件缺失返回空（不崩）", t10 === "", t10.slice(0, 80));
