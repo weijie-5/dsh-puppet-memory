@@ -749,7 +749,7 @@ function defaultConfig() {
     // v0.38（B-70）：检索走哪条路。scan=每次扫 JSONL（默认，行为跟以前一模一样）；
     // sqlite=用 state/search-index.sqlite 这份派生索引拿候选（按文件增量重建，删了会自动重放）。
     // 默认 scan：新路径必须先在真数据上跑赢、跑稳才改默认（0.37.0 的教训）。
-    search: { engine: "scan" },
+    search: { engine: "scan", charFallback: false, charFallbackLimit: 4 },
     // v0.39（B-94）：取词器 + 提词器。默认关——它每回合要调一次小模型判「这算不算回忆」。
     // 取词器只管取（重要库优先），提词器只管判 + 给一句自然语言提示，不贴资料块。
     cueprompt: { enabled: false, maxCandidates: 7, maxHintChars: 140, model: null, mode: "assist", minSharedTerms: 1 },
@@ -3489,6 +3489,34 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
   }
 
   const candidates = [];
+  // v0.40（B-98）：字面兜底。BM25 只要一个二元组都不重合就丢（"住几楼" 问、"住四楼" 写），
+  // 同义/改写类问题会整条漏掉。这里补一条**追加**通道：按「单字 IDF 加权覆盖率」再挑几条，
+  // 排在 BM25 结果**后面**（实测插队会顶掉真命中：修 4 坏 4）。默认关，config.search.charFallback=true 才开。
+  const charCfg = (() => {
+    try {
+      const s = loadConfig().search || {};
+      const rawLimit = Number(s.charFallbackLimit);
+      const limit = Number.isFinite(rawLimit) ? Math.max(0, Math.min(8, rawLimit)) : 4;
+      return { on: s.charFallback === true && limit > 0, limit };
+    } catch {
+      return { on: false, limit: 4 };
+    }
+  })();
+  const CHAR_STOP = new Set("的了吗呢吧啊是我你他她它在有和就不这那什么几多少怎么个要会能把被给让说想能过又也都只自己先后怎样这种那个一些".split(""));
+  const qChars = charCfg.on
+    ? [...new Set(String(q || "").replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, "").split("").filter((c) => !CHAR_STOP.has(c)))]
+    : [];
+  const charCandidates = [];
+  let charIdf = null;
+  if (qChars.length) {
+    const df = new Map();
+    for (const doc of docsToScan) {
+      if (!allowed.has(doc.file)) continue;
+      for (const c of qChars) if (doc.low.includes(c)) df.set(c, (df.get(c) || 0) + 1);
+    }
+    const total = docsToScan.length || 1;
+    charIdf = new Map(qChars.map((c) => [c, Math.log(1 + total / Math.max(1, df.get(c) || 0))]));
+  }
   const now = Date.now();
   for (const doc of docsToScan) {
     if (!allowed.has(doc.file)) continue;
@@ -3515,6 +3543,18 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
       tagHit = entryTags.some((t) => t.includes(tagNeedle));
     }
     if (!tagHit) continue;
+    // v0.40（B-98）：字面兜底的候选（只在开了 charFallback 时算；过完滤就算，不看二元组门）
+    if (charIdf && qChars.length) {
+      let got = 0;
+      let all = 0;
+      for (const c of qChars) {
+        const w = charIdf.get(c) || 0;
+        all += w;
+        if (doc.low.includes(c)) got += w;
+      }
+      const cover = all ? got / all : 0;
+      if (cover >= 0.25) charCandidates.push({ doc, cover });
+    }
     // 候选门：整词命中，或者至少命中一个二元组（完全不重合的行提前丢掉，BM25 只在候选里算）
     // 试过用「起 idf 覆盖率门槛」挡假命中（BM25_COVERAGE_MIN），但同义改写本来就命中得少，
     // 一挡就把 A 组从 50%/70% 打回 10%/10%——**宁可多给，也别把真命中挡掉**。
@@ -3555,7 +3595,7 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     untilMs !== null ? `until=${opts.until}` : "",
     layerList.some((l) => l !== "all") ? `layers=${layerList.join(",")}` : "",
   ].filter(Boolean).join("、");
-  if (!candidates.length) {
+  if (!candidates.length && !charCandidates.length) {
     const suffix = filterNote ? `（加了过滤：${filterNote}）` : "";
     if (q) return `没有找到包含「${q}」${tagNeedle ? `且带标签「${tagQuery}」` : ""}的记忆${suffix}。`;
     return `没有找到带标签「${tagQuery}」的记忆${suffix}。`;
@@ -3569,11 +3609,36 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     .sort((a, b) => b.score - a.score || b.ts - a.ts)
     .slice(0, max);
   if (!picked.length) {
+    // v0.40（B-98）：BM25 全军覆没时，字面兜底顶上（问法改写类的最后一道网）
+    const fallback = charCandidates
+      .filter((c) => includeEnded || !c.doc.ended)
+      .filter((c) => !(c.doc.entry?.voided && !includeVoided))
+      .sort((a, b) => b.cover - a.cover)
+      .slice(0, max);
+    if (fallback.length) {
+      const srcIdx0 = sourceIndex();
+      const body = fallback.map((c) => formatSearchHit(c.doc, srcIdx0)).join("\n");
+      return `（BM25 一个二元组都没重合，下面是字面兜底（按单字重合）找到的 ${fallback.length} 条——问法可能和原文不一样，自己核对）\n${body}`;
+    }
     if (q) return `没有找到分数 ≥${minScore} 的记忆（想放宽就去掉 minScore）。`;
     return `没有找到带标签「${tagQuery}」的记忆。`;
   }
   const srcIdx = sourceIndex();
   const lines = picked.map((c) => formatSearchHit(c.doc, srcIdx));
+  // v0.40（B-98）：字面兜底追加——排在 BM25 命中之后，不顶掉真命中
+  if (charCfg.on && charCandidates.length) {
+    const pickedDocs = new Set(picked.map((c) => c.doc));
+    const extra = charCandidates
+      .filter((c) => !pickedDocs.has(c.doc))
+      .filter((c) => includeEnded || !c.doc.ended)
+      .filter((c) => !(c.doc.entry?.voided && !includeVoided))
+      .sort((a, b) => b.cover - a.cover || b.doc.ts - a.doc.ts)
+      .slice(0, charCfg.limit);
+    if (extra.length) {
+      lines.push(`（下面 ${extra.length} 条是字面兜底：二元组没重合，单字重合度高——问法和原文用词可能不一样，自己核对）`);
+      for (const c of extra) lines.push(formatSearchHit(c.doc, srcIdx));
+    }
+  }
   // 降级时要说清楚：以下是过期的，不是现状
   const degraded = !includeEnded && !live.length && ended.length > 0;
   if (degraded) {
