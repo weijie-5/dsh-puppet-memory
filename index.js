@@ -3588,6 +3588,27 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     if (entry?.kind === "auto-summary") score -= 1.5;
     candidates.push({ doc, score, ts: Number.isFinite(tsMs) ? tsMs : 0 });
   }
+  // v0.40（B-99）：guide 是「线索→条目」的衍生索引（同一 hash 会有多行），不当正文重复返回。
+  // 规则：同一 hash 只留一条，优先留真条目（非 guide 文件）；只有 guide 行时留分数最高的一条。
+  const hashOfDoc = (doc) => (doc?.entry?.hash ? String(doc.entry.hash) : "");
+  const isGuideDoc = (doc) => rel(doc.file) === "deep/guide.jsonl";
+  const dedupeCandidates = (list) => {
+    const byHash = new Map();
+    const noHash = [];
+    for (const c of list) {
+      const h = hashOfDoc(c.doc);
+      if (!h) { noHash.push(c); continue; }
+      const prev = byHash.get(h);
+      if (!prev) { byHash.set(h, c); continue; }
+      const prevGuide = isGuideDoc(prev.doc);
+      const curGuide = isGuideDoc(c.doc);
+      if (prevGuide && !curGuide) byHash.set(h, c);
+      else if (prevGuide === curGuide && Number(c.score) > Number(prev.score)) byHash.set(h, c);
+    }
+    return [...byHash.values(), ...noHash];
+  };
+  const candidatesD = dedupeCandidates(candidates);
+  const charCandD = dedupeCandidates(charCandidates);
   const filterNote = [
     statusFilter ? `status=${statusFilter}` : "",
     kindFilter ? `kind=${kindFilter}` : "",
@@ -3595,22 +3616,22 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     untilMs !== null ? `until=${opts.until}` : "",
     layerList.some((l) => l !== "all") ? `layers=${layerList.join(",")}` : "",
   ].filter(Boolean).join("、");
-  if (!candidates.length && !charCandidates.length) {
+  if (!candidatesD.length && !charCandD.length) {
     const suffix = filterNote ? `（加了过滤：${filterNote}）` : "";
     if (q) return `没有找到包含「${q}」${tagNeedle ? `且带标签「${tagQuery}」` : ""}的记忆${suffix}。`;
     return `没有找到带标签「${tagQuery}」的记忆${suffix}。`;
   }
   // v0.37（B-74）：默认只用「还生效」的；一条都没有时才降级——真但过期好过查无此事
-  const live = candidates.filter((c) => !c.doc.ended);
-  const ended = candidates.filter((c) => c.doc.ended);
-  const useEnded = includeEnded ? candidates : live.length ? live : ended;
+  const live = candidatesD.filter((c) => !c.doc.ended);
+  const ended = candidatesD.filter((c) => c.doc.ended);
+  const useEnded = includeEnded ? candidatesD : live.length ? live : ended;
   const picked = useEnded
     .filter((c) => !minScore || c.score >= minScore)
     .sort((a, b) => b.score - a.score || b.ts - a.ts)
     .slice(0, max);
   if (!picked.length) {
     // v0.40（B-98）：BM25 全军覆没时，字面兜底顶上（问法改写类的最后一道网）
-    const fallback = charCandidates
+    const fallback = charCandD
       .filter((c) => includeEnded || !c.doc.ended)
       .filter((c) => !(c.doc.entry?.voided && !includeVoided))
       .sort((a, b) => b.cover - a.cover)
@@ -3626,9 +3647,9 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
   const srcIdx = sourceIndex();
   const lines = picked.map((c) => formatSearchHit(c.doc, srcIdx));
   // v0.40（B-98）：字面兜底追加——排在 BM25 命中之后，不顶掉真命中
-  if (charCfg.on && charCandidates.length) {
+  if (charCfg.on && charCandD.length) {
     const pickedDocs = new Set(picked.map((c) => c.doc));
-    const extra = charCandidates
+    const extra = charCandD
       .filter((c) => !pickedDocs.has(c.doc))
       .filter((c) => includeEnded || !c.doc.ended)
       .filter((c) => !(c.doc.entry?.voided && !includeVoided))
