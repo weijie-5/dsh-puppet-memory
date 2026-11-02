@@ -92,6 +92,9 @@ const PATHS = {
   diaryDir: path.join(MEM_DIR, "behavior", "diary"),
   deep: path.join(MEM_DIR, "deep"),
   sayings: path.join(MEM_DIR, "deep", "sayings.jsonl"),
+  // v0.40（B-99）：开幕表——特殊日子（生日/纪念日），每天第一次打开读一次
+  opening: path.join(MEM_DIR, "deep", "opening-table.jsonl"),
+  openingLunarMap: path.join(MEM_DIR, "deep", "opening-lunar-map.json"),
   treeDir: path.join(MEM_DIR, "deep", "tree"),
   guide: path.join(MEM_DIR, "deep", "guide.jsonl"),
   // 压缩记录（v0.18）：只从官方 compaction/* 会话事件里取，一次压缩一行。
@@ -746,6 +749,8 @@ function defaultConfig() {
     // v0.38（B-86）：到期提醒。只做「欠着的事」一种——条目带 until 且已过 → 注入一条汇总（零模型调用）。
     // 每条只推一次（推过的 hash 记在 state/due.json），一天最多推一条汇总块；默认关，开了才会推。
     due: { enabled: false, maxItems: 3, maxChars: 140 },
+    // v0.40（B-99）：开幕表。每天第一次打开时把「今天/最近 N 天」的特殊日子读一次，读一次就标记。
+    opening: { enabled: true, lookaheadDays: 7, maxItems: 5 },
     // v0.38（B-70）：检索走哪条路。scan=每次扫 JSONL（默认，行为跟以前一模一样）；
     // sqlite=用 state/search-index.sqlite 这份派生索引拿候选（按文件增量重建，删了会自动重放）。
     // 默认 scan：新路径必须先在真数据上跑赢、跑稳才改默认（0.37.0 的教训）。
@@ -1416,6 +1421,85 @@ function collectDueEntries(nowMs) {
     }
   }
   return out;
+}
+
+// v0.40（B-99）：开幕表——只记「特殊日子」（生日/纪念日），**每天**第一次打开时读一次。
+// 为什么单独一条通道：这类信息不是「记忆」，是日历；一天读一次就够，读多了就是噪音。
+//
+// 数据：deep/opening-table.jsonl，一行一个日子。两种写法：
+//   ① 直接给阳历：{date:"2026-12-31", label:"跨年"}
+//   ② 给农历：    {lunar:"09-16", label:"丹阳生日", note:"…"}   ← 具体阳历日期自动换算并「记下一次」
+// 换算表：deep/opening-lunar-map.json，形如 {"09-16": {"2026":"2026-10-25", …}}
+// （这张表是生成物，用 python 的 lunardate 一次性算出 1997–2065，插件运行时只读它、不自己算农历。）
+// 生日「经过那一次」的机制：每次检查时，为每个农历条目补齐今年/明年/后年的阳历行 —— 走过一年就补一年，
+// 表里的农历日期不用人管；闰月按常规月算（农历九月的闰九月不另开一行）。
+function ensureOpeningLunarRows({ persist = true, nowMs = Date.now() } = {}) {
+  if (!fs.existsSync(PATHS.opening)) return { added: 0, pruned: 0 };
+  let rows = readJsonl(PATHS.opening);
+  const lunarRows = rows.filter((r) => r && typeof r.lunar === "string" && /^\d{1,2}-\d{1,2}$/.test(r.lunar.trim()));
+  if (!lunarRows.length) return { added: 0, pruned: 0 };
+  const mapPath = PATHS.openingLunarMap;
+  if (!fs.existsSync(mapPath)) return { added: 0, pruned: 0 };
+  let map = null;
+  try {
+    map = JSON.parse(readText(mapPath) || "{}");
+  } catch {
+    return { added: 0, pruned: 0 };
+  }
+  const year = new Date(nowMs).getFullYear();
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const key = (lunar) => lunar.trim().split("-").map((x) => pad2(Number(x))).join("-");
+  const added = [];
+  for (const src of lunarRows) {
+    const m = map[key(src.lunar)] || {};
+    for (const y of [year, year + 1, year + 2]) {
+      const solar = m[String(y)];
+      if (!solar) continue;
+      if (rows.some((r) => r && String(r.date || "") === solar && String(r.label || "") === String(src.label || ""))) continue;
+      added.push({ date: solar, label: src.label, kind: src.kind || "event", note: src.note || "", from: "lunar", lunar: key(src.lunar) });
+    }
+  }
+  // 两年前的老行清掉，别让表只增不减
+  const cutoff = `${year - 1}-01-01`;
+  const kept = rows.filter((r) => r && !(String(r.from || "") === "lunar" && String(r.date || "") < cutoff));
+  const pruned = rows.length - kept.length;
+  if (persist && (added.length || pruned)) {
+    safe("开幕表补齐", () => writeJsonl(PATHS.opening, [...kept, ...added]));
+  }
+  return { added: added.length, pruned };
+}
+
+function buildOpeningInjection(cfg, { nowMs = Date.now(), persist = true } = {}) {
+  const opt = Object.assign({ enabled: true, lookaheadDays: 7, maxItems: 5 }, cfg?.opening || {});
+  if (opt.enabled === false) return "";
+  if (!fs.existsSync(PATHS.opening)) return "";
+  if (persist) ensureOpeningLunarRows({ persist, nowMs });
+  const seenPath = path.join(PATHS.stateDir, "opening-seen.json");
+  const pad = (n) => String(n).padStart(2, "0");
+  const d = new Date(nowMs);
+  const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  let seen = null;
+  try {
+    seen = readJson(seenPath, null);
+  } catch {
+    seen = null;
+  }
+  if (seen && String(seen.date || "") === today) return "";
+  const rows = readJsonl(PATHS.opening).filter((r) => r && !r.voided && /^\d{4}-\d{2}-\d{2}$/.test(String(r.date || "")));
+  if (!rows.length) return "";
+  const dayMs = 86400000;
+  const todayMs = new Date(`${today}T00:00:00`).getTime();
+  const hits = [];
+  for (const r of rows) {
+    const t = new Date(`${String(r.date)}T00:00:00`).getTime();
+    if (!Number.isFinite(t)) continue;
+    const diff = Math.round((t - todayMs) / dayMs);
+    if (diff === 0) hits.push(`今天：${r.label}${r.note ? `（${clip(String(r.note), 60)}）` : ""}`);
+    else if (diff > 0 && diff <= Number(opt.lookaheadDays)) hits.push(`还有 ${diff} 天：${r.date} ${r.label}`);
+  }
+  if (!hits.length) return "";
+  if (persist) safe("开幕表标记", () => writeJson(seenPath, { date: today, at: nowISO() }));
+  return ["<puppet_opening>", "开幕表（特殊日子，每天第一次打开时读一次；不是用户消息）：", ...hits.slice(0, Math.max(1, Number(opt.maxItems) || 5)), "</puppet_opening>"].join("\n");
 }
 
 function buildDueInjection(cfg, { nowMs = Date.now(), persist = true } = {}) {
@@ -6793,6 +6877,7 @@ function apply(ctx) {
         let handoffText = "";
         let recallText = "";
         let dueText = "";
+        let openingText = "";
         let cueText = "";
         try {
           if (!suppressed.has("handoff")) handoffText = buildHandoffInjection(cfg);
@@ -6803,6 +6888,8 @@ function apply(ctx) {
           }
           // v0.38（B-86）：到期的欠着的事（默认关；一天最多推一条汇总，每条只推一次）
           if (!suppressed.has("due")) dueText = buildDueInjection(cfg);
+          // v0.40（B-99）：开幕表——今天/最近 N 天的特殊日子，每天只读一次
+          if (!suppressed.has("opening")) openingText = buildOpeningInjection(cfg);
 
           // v0.39（B-94）：取词器 + 提词器。默认关；开着时每回合可能多一次小模型调用。
           // 丹阳 2026-10-29 定的分工：取词器**每回合取新词**（不被待判堵住）；
@@ -6985,8 +7072,8 @@ function apply(ctx) {
         } catch (err) {
           diag(`社交档案注入失败：${err?.message || err}`);
         }
-        if (!text && !socialText && !handoffText && !recallText && !dueText && !cueText && !rulesForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
-        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}\u0000${cueText}\u0000${rulesForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
+        if (!text && !socialText && !handoffText && !recallText && !dueText && !openingText && !cueText && !rulesForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
+        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}${openingText}\u0000${cueText}\u0000${rulesForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
         if (lastInjected.get(sessionId) === digest) {
           if (injectMode === "first-step") injectedOnce.add(sessionId);
           return decision;
@@ -7030,10 +7117,11 @@ function apply(ctx) {
         const handoffMessage = handoffText ? injectionMessage(handoffText) : null;
         const recallMessage = recallText ? injectionMessage(recallText) : null;
         const dueMessage = dueText ? injectionMessage(dueText) : null;
+        const openingMessage = openingText ? injectionMessage(openingText) : null;
         const cueMessage = cueText ? injectionMessage(cueText) : null;
         return {
           kind: "enter",
-          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
+          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
         };
       } catch (err) {
         log("warn", `pre-step 注入失败：${err?.message || err}`);
@@ -8348,6 +8436,6 @@ const plugin = {
   apply,
 };
 
-export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
+export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
 export default plugin;
 
