@@ -1446,18 +1446,31 @@ function ensureOpeningLunarRows({ persist = true, nowMs = Date.now() } = {}) {
   } catch {
     return { added: 0, pruned: 0 };
   }
-  const year = new Date(nowMs).getFullYear();
   const pad2 = (n) => String(n).padStart(2, "0");
+  const d = new Date(nowMs);
+  const today = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const year = d.getFullYear();
   const key = (lunar) => lunar.trim().split("-").map((x) => pad2(Number(x))).join("-");
   const added = [];
   for (const src of lunarRows) {
     const m = map[key(src.lunar)] || {};
-    for (const y of [year, year + 1, year + 2]) {
-      const solar = m[String(y)];
-      if (!solar) continue;
-      if (rows.some((r) => r && String(r.date || "") === solar && String(r.label || "") === String(src.label || ""))) continue;
-      added.push({ date: solar, label: src.label, kind: src.kind || "event", note: src.note || "", from: "lunar", lunar: key(src.lunar) });
-    }
+    // 一次只算一年：今年还没过就用今年，过了就补明年。走过那一年，下次检查才补下一年。
+    // 闰月规则（丹阳 2026-11-02 定）：「闰九月应该是算一次」——按常规月算，闰月不另开一天。
+    const candidates = [m[String(year)], m[String(year + 1)]].filter((x) => typeof x === "string" && x && x >= today);
+    if (!candidates.length) continue;
+    const solar = candidates[0];
+    if (rows.some((r) => r && String(r.date || "") === solar && String(r.label || "") === String(src.label || ""))) continue;
+    const hash = sha1(`opening|${solar}|${src.label}`).slice(0, 16);
+    added.push({
+      hash,
+      date: solar,
+      label: src.label,
+      kind: src.kind || "event",
+      note: src.note || "",
+      source: src.source || "",
+      from: "lunar",
+      lunar: key(src.lunar),
+    });
   }
   // 两年前的老行清掉，别让表只增不减
   const cutoff = `${year - 1}-01-01`;
@@ -2647,7 +2660,8 @@ function searchTargets(layer) {
     PATHS.notes,
     ...dirJsonl(PATHS.diaryDir),
   ];
-  const deep = [PATHS.sayings, PATHS.guide, ...dirJsonl(PATHS.treeDir)];
+  // v0.40（B-99③）：开幕表也进检索——「我的生日是哪天/谁说的」要能搜到，来源在 source 字段
+  const deep = [PATHS.sayings, PATHS.guide, PATHS.opening, ...dirJsonl(PATHS.treeDir)];
   const array = [...arrayIndexFiles(), PATHS.sessionsIndex];
   if (layer === "behavior") return behavior;
   if (layer === "deep") return deep;
