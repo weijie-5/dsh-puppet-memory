@@ -3321,6 +3321,39 @@ function bm25ScoreOf(doc, qTokens, index) {
   return score;
 }
 
+// v0.40（B-99②）：guide.jsonl 的行只是「指针」（file + hash），命中时把真条目读出来再渲染，
+// 免得好好的记忆在搜索结果里显示成一行索引 JSON。读不到就原样返回，不假装。
+const guideResolveCache = new Map(); // 目标文件 → { sig, byHash: Map<hash, {line, lineNo, entry}> }
+function resolveGuideDoc(doc) {
+  const e = doc?.entry;
+  if (!e || !e.file || !e.hash) return null;
+  if (rel(doc.file) !== "deep/guide.jsonl") return null;
+  const target = path.resolve(MEM_DIR, String(e.file));
+  const root = path.resolve(MEM_DIR);
+  if (!target.startsWith(root)) return null; // 防越界
+  try {
+    const st = fs.statSync(target);
+    const sig = `${st.size}:${Math.round(st.mtimeMs)}`;
+    let slot = guideResolveCache.get(target);
+    if (!slot || slot.sig !== sig) {
+      const byHash = new Map();
+      fs.readFileSync(target, "utf8").split(/\r?\n/).forEach((line, i) => {
+        if (!line.trim()) return;
+        const ent = parseJsonlLine(line);
+        const h = ent?.hash ? String(ent.hash) : "";
+        if (h && !byHash.has(h)) byHash.set(h, { line, lineNo: i + 1, entry: ent });
+      });
+      slot = { sig, byHash };
+      guideResolveCache.set(target, slot);
+    }
+    const hit = slot.byHash.get(String(e.hash));
+    if (!hit) return null;
+    return { file: target, line: hit.line, lineNo: hit.lineNo, entry: hit.entry, ts: hit.entry?.ts ? Date.parse(hit.entry.ts) || 0 : 0 };
+  } catch {
+    return null; // 原文件被删/读不了 → 保留指针原样
+  }
+}
+
 function formatSearchHit(doc, srcIdx) {
   const entry = doc.entry;
   const file = doc.file;
@@ -3638,14 +3671,25 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
       .slice(0, max);
     if (fallback.length) {
       const srcIdx0 = sourceIndex();
-      const body = fallback.map((c) => formatSearchHit(c.doc, srcIdx0)).join("\n");
+      const body = fallback
+        .map((c) => {
+          const real = resolveGuideDoc(c.doc);
+          return real ? `${formatSearchHit({ ...real, ended: c.doc.ended }, srcIdx0)}（经线索找到）` : formatSearchHit(c.doc, srcIdx0);
+        })
+        .join("\n");
       return `（BM25 一个二元组都没重合，下面是字面兜底（按单字重合）找到的 ${fallback.length} 条——问法可能和原文不一样，自己核对）\n${body}`;
     }
     if (q) return `没有找到分数 ≥${minScore} 的记忆（想放宽就去掉 minScore）。`;
     return `没有找到带标签「${tagQuery}」的记忆。`;
   }
   const srcIdx = sourceIndex();
-  const lines = picked.map((c) => formatSearchHit(c.doc, srcIdx));
+  // v0.40（B-99②）：guide 命中把指针换成真条目再渲染
+  const renderHit = (doc) => {
+    const real = resolveGuideDoc(doc);
+    if (!real) return formatSearchHit(doc, srcIdx);
+    return `${formatSearchHit({ ...real, ended: doc.ended }, srcIdx)}（经线索找到）`;
+  };
+  const lines = picked.map((c) => renderHit(c.doc));
   // v0.40（B-98）：字面兜底追加——排在 BM25 命中之后，不顶掉真命中
   if (charCfg.on && charCandD.length) {
     const pickedDocs = new Set(picked.map((c) => c.doc));
@@ -3657,7 +3701,7 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
       .slice(0, charCfg.limit);
     if (extra.length) {
       lines.push(`（下面 ${extra.length} 条是字面兜底：二元组没重合，单字重合度高——问法和原文用词可能不一样，自己核对）`);
-      for (const c of extra) lines.push(formatSearchHit(c.doc, srcIdx));
+      for (const c of extra) lines.push(renderHit(c.doc));
     }
   }
   // 降级时要说清楚：以下是过期的，不是现状
@@ -3678,7 +3722,10 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
   const prependCount = briefCfg.enabled === false ? 0 : Math.max(0, Number(briefCfg.prependHits ?? 3) || 0);
   if (prependCount > 0) {
     const heads = picked
-      .map((c) => ({ brief: briefOf(c.doc.entry), hash: c.doc.entry?.hash ? String(c.doc.entry.hash) : "" }))
+      .map((c) => {
+        const ent = (resolveGuideDoc(c.doc) || {}).entry || c.doc.entry;
+        return { brief: briefOf(ent), hash: ent?.hash ? String(ent.hash) : "" };
+      })
       .filter((h) => h.brief)
       .slice(0, prependCount)
       .map((h, i) => `${i + 1}. ${h.brief}${h.hash ? `  #${h.hash}` : ""}`);
