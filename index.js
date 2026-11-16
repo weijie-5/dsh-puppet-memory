@@ -2431,6 +2431,19 @@ function memoryOverview() {
       sayings: countLines(PATHS.sayings),
       diary: Number(backup && backup.diaryExported) || 0,
     },
+    opening: (() => {
+      try {
+        return readOpeningRows().map((r) => ({
+          label: r.label || "",
+          date: r.date || "",
+          lunar: r.lunar || "",
+          repeat: r.repeat || "",
+          note: r.note || "",
+        }));
+      } catch {
+        return [];
+      }
+    })(),
     compactions: Number(st.compaction && st.compaction.count) || 0,
     lastCompactionAt: (st.compaction && st.compaction.lastAt) || "",
     backup: backup

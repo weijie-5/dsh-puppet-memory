@@ -257,6 +257,18 @@ window.__ModuleLoader__.load({
           ),
         ),
         h('div', { className: 'pmb-card' },
+          h('div', { className: 'pmb-title' }, '开幕表'),
+          (data.opening && data.opening.length)
+            ? h('div', { className: 'pmb-grid' },
+                data.opening.map((r, i) => h('div', { key: i, className: 'pmb-kv' },
+                  h('div', { className: 'pmb-k' }, r.label + (r.repeat === 'yearly' ? '（每年）' : '')),
+                  h('div', { className: 'pmb-v' }, (r.date || (r.lunar ? '农历 ' + r.lunar : '')) + (r.note ? '' : '')),
+                )),
+              )
+            : h('div', { className: 'pmb-hint' }, '表是空的（用 memory_opening add 加一条特殊日子）。'),
+          h('div', { className: 'pmb-sub' }, '每天第一次打开时读一次；到点提醒一次。'),
+        ),
+        h('div', { className: 'pmb-card' },
           h('div', { className: 'pmb-title' }, '压缩与备份'),
           h('div', { className: 'pmb-grid' },
             h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '累计压缩'), h('div', { className: 'pmb-v' }, String(data.compactions || 0) + ' 次')),
