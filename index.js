@@ -2367,7 +2367,7 @@ const FEATURE_TOGGLES = [
   { id: "lines", label: "三线状态", desc: "工作 / 陪伴 / 学习 的取向", group: "lines", def: true },
   { id: "conflict", label: "冲突核对", desc: "本地小模型核对事实矛盾；没配 endpoint 就自动跳过", group: "conflict", def: false },
   { id: "cueprompt", label: "取词器", desc: "每回合按话题取词（可能多一次模型调用）", group: "cueprompt", def: false },
-  { id: "social", label: "多人多群记忆", desc: "群聊与多人身份分区（我们用不上）", group: "social", def: false },
+  { id: "social", label: "多人多群记忆", desc: "群聊与多人身份分区：同一人跨群识别、信息按群隔离（只跟一个人聊可以关）", group: "social", def: false },
 ];
 
 function featuresView() {

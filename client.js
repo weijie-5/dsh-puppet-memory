@@ -249,7 +249,7 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'pmb' },
         h('div', { className: 'pmb-title' }, '功能开关'),
-        h('div', { className: 'pmb-hint' }, '这里列的是这台机器上「记忆插件」的各个功能。默认关着的也在这里——不列出来，就容易一直忘着。'),
+        h('div', { className: 'pmb-hint' }, '这里是插件的全部可选功能。用不上的关着，用得上的打开——每个人的用法不一样，不用全开；默认关的也列出来，不列出来就容易一直忘着。'),
         error ? h('div', { className: 'pmb-error' }, error) : null,
         notice ? h('div', { className: 'pmb-hint' }, notice) : null,
         items === null
