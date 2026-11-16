@@ -52,6 +52,7 @@ window.__ModuleLoader__.load({
       '.pmb-input-wide{width:min(100%,380px)}',
       '.pmb-btn{padding:6px 14px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);cursor:pointer;font-size:13px}',
       '.pmb-btn:disabled{opacity:.5;cursor:default}',
+      '.pmb-btn-on{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}',
       '.pmb-btn-primary{background:var(--dsw-alias-button-primary-fill);border-color:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}',
       '.pmb-btn-primary:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}',
       '.pmb-note{font-size:12px;padding:8px 10px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}',
@@ -205,6 +206,70 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------
     // 页 1：自动摘要（独立设置页）
     // ---------------------------------------------------------------
+    function FeaturesPanel() {
+      const { useState, useEffect, useCallback } = React
+      const [items, setItems] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState('')
+      const [notice, setNotice] = useState('')
+
+      const load = useCallback(async () => {
+        setBusy(true)
+        setError('')
+        try {
+          const res = await callApi('features')
+          if (!res || res.ok !== true) throw new Error((res && res.error) || '读取失败')
+          setItems(res.items || [])
+        } catch (err) {
+          setError(err && err.message ? err.message : String(err))
+        } finally {
+          setBusy(false)
+        }
+      }, [])
+
+      useEffect(() => {
+        load()
+      }, [load])
+
+      const toggle = async (item) => {
+        setBusy(true)
+        setError('')
+        setNotice('')
+        try {
+          const res = await callApi('save-feature', { id: item.id, enabled: !item.enabled })
+          if (!res || res.ok !== true) throw new Error((res && res.error) || '保存失败')
+          setItems(res.items || [])
+          setNotice(`「${item.label}」已${item.enabled ? '关闭' : '打开'}，下一轮生效。`)
+        } catch (err) {
+          setError(err && err.message ? err.message : String(err))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h('div', { className: 'pmb' },
+        h('div', { className: 'pmb-title' }, '功能开关'),
+        h('div', { className: 'pmb-hint' }, '这里列的是这台机器上「记忆插件」的各个功能。默认关着的也在这里——不列出来，就容易一直忘着。'),
+        error ? h('div', { className: 'pmb-error' }, error) : null,
+        notice ? h('div', { className: 'pmb-hint' }, notice) : null,
+        items === null
+          ? h('div', { className: 'pmb-hint' }, '读取中…')
+          : h('div', { className: 'pmb-list' },
+              items.map((item) => h('div', { key: item.id, className: 'pmb-row' },
+                h('div', { style: { flex: 1 } },
+                  h('div', { className: 'pmb-k' }, item.label),
+                  h('div', { className: 'pmb-hint' }, item.desc),
+                ),
+                h('button', {
+                  className: item.enabled ? 'pmb-btn pmb-btn-on' : 'pmb-btn',
+                  disabled: busy,
+                  onClick: () => toggle(item),
+                }, item.enabled ? '已开启' : '已关闭'),
+              )),
+            ),
+      )
+    }
+
     function AutoSummaryPanel() {
       const { useState, useEffect, useCallback } = React
       const [summaries, setSummaries] = useState(null)
@@ -1290,6 +1355,10 @@ window.__ModuleLoader__.load({
       if (slots === undefined || slots === null) return
       slots.inject('settings.section', () => {
         // 两个独立设置页：一个页面一个 list 条目，互不挤在一起
+        slots.register(
+          { name: 'settings.section', id: 'puppet-features', order: 25, label: '功能开关' },
+          () => h(FeaturesPanel),
+        )
         slots.register(
           { name: 'settings.section', id: 'puppet-backup', order: 26, label: '记忆备份' },
           () => h(BackupPanel),
