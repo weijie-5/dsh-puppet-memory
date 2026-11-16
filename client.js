@@ -235,7 +235,7 @@ window.__ModuleLoader__.load({
       const counts = data.counts || {}
       const backup = data.backup || {}
       return h('div', { className: 'pmb' },
-        h('div', { className: 'pmb-title' }, '记忆设置'),
+        h('div', { className: 'pmb-title' }, '记忆'),
         h('div', { className: 'pmb-hint' }, '这台机器上的记忆现在长什么样。三张常驻卡的额度、各层条目数、压缩与备份的状态都在这儿。'),
         h('div', { className: 'pmb-card' },
           h('div', { className: 'pmb-title' }, '常驻卡'),
@@ -273,7 +273,7 @@ window.__ModuleLoader__.load({
       const { useState } = React
       const [tab, setTab] = useState('features')
       const tabs = [
-        ['overview', '记忆设置'],
+        ['overview', '记忆'],
         ['features', '功能开关'],
         ['backup', '备份'],
         ['summary', '自动摘要'],
@@ -1439,7 +1439,7 @@ window.__ModuleLoader__.load({
         // 两个独立设置页：一个页面一个 list 条目，互不挤在一起
         // v1.1：四个页面合并成一页（顶部 tab 切换），设置列表里只占一行
         slots.register(
-          { name: 'settings.section', id: 'puppet-memory', order: 25, label: '记忆' },
+          { name: 'settings.section', id: 'puppet-memory', order: 25, label: '记忆设置' },
           () => h(MemorySettingsPanel),
         )
 

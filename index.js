@@ -2434,7 +2434,14 @@ function memoryOverview() {
     compactions: Number(st.compaction && st.compaction.count) || 0,
     lastCompactionAt: (st.compaction && st.compaction.lastAt) || "",
     backup: backup
-      ? { dir: backup.dir || "", lastAt: backup.lastAt || "", lastSnapshot: backup.lastSnapshot || "", keepDays: backup.keepDays }
+      ? {
+          dir: (backup.config && backup.config.dir) || "",
+          keepDays: (backup.config && backup.config.keepDays) || 0,
+          lastAt: (backup.runtime && backup.runtime.lastBackupAt) || "",
+          lastSnapshot: (backup.runtime && backup.runtime.latestSnapshot) || "",
+          snapshots: (backup.runtime && backup.runtime.snapshots) || 0,
+          warning: (backup.runtime && backup.runtime.warning) || "",
+        }
       : null,
   };
 }
