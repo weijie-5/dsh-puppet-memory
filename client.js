@@ -212,6 +212,9 @@ window.__ModuleLoader__.load({
       const { useState, useEffect, useCallback } = React
       const [data, setData] = useState(null)
       const [error, setError] = useState('')
+      // 注意：hooks 必须在任何 early return 之前——放下面会让首次渲染和后续渲染的 hook 数量不一致，整页白屏
+      const [editing, setEditing] = useState(null)
+      const [editDraft, setEditDraft] = useState({ label: '', date: '', lunar: '', note: '' })
 
       const load = useCallback(async () => {
         setError('')
@@ -231,8 +234,6 @@ window.__ModuleLoader__.load({
       if (error) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-error' }, error))
       if (!data) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-hint' }, '读取中…'))
 
-      const [editing, setEditing] = React.useState(null)
-      const [editDraft, setEditDraft] = React.useState({ label: '', date: '', lunar: '', note: '' })
       const startEdit = (i, r) => {
         setEditing(i)
         setEditDraft({ label: r.label || '', date: r.date || '', lunar: r.lunar || '', note: r.note || '' })
