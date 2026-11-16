@@ -40,6 +40,7 @@ import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPat
 import { createLearn, coreLock, checkAbsurd } from "./learn.js";
 import { createConflictChecker, conflictDefaults } from "./conflict.js";
 import { createLorebook, loreDefaults } from "./lorebook.js";
+import { createCircles, circleDefaults } from "./circle.js";
 import { createSearchIndex, sqliteAvailable, sqliteUnavailableReason } from "./searchindex.js";
 import { bigramsOf, createCuePrompter, selfEchoOf, stripInjected, verdictOf, worthCueing } from "./cueprompt.js";
 import { createRules, formatRuleRow, parseRulesMarkdown, rulesDefaults } from "./rules.js";
@@ -3808,6 +3809,13 @@ function loreLayer() {
   return loreSingleton;
 }
 
+// 圈子印象（v1.0，2026-11-16）：按网站记住"那里的人怎么说话"——只影响表达，不参与判定
+let circleSingleton = null;
+function circleLayer() {
+  if (!circleSingleton) circleSingleton = createCircles({ dir: MEM_DIR });
+  return circleSingleton;
+}
+
 let conflictSingleton = null;
 function conflictLayer() {
   if (!conflictSingleton) {
@@ -7330,6 +7338,7 @@ function apply(ctx) {
         let cueText = "";
         let conflictText = "";
         let loreText = "";
+        let circleText = "";
         let lostDetailText = "";
         try {
           // v0.42：每轮现读 config.json（几百字节，代价可忽略）——参数改完下一轮就生效，不用重启。
@@ -7353,6 +7362,15 @@ function apply(ctx) {
               }
             } catch (err) {
               diag(`世界书注入跳过：${err?.message || err}`);
+            }
+            // 圈子印象：当前话题提到哪个网站，就带那里的"怎么说话"
+            try {
+              const cc = { ...circleDefaults, ...((cfgLive && cfgLive.circle) || {}) };
+              if (cc.enabled !== false && !suppressed.has("circle")) {
+                circleText = circleLayer().render(circleLayer().pick(userText, cc), cc);
+              }
+            } catch (err) {
+              diag(`圈子印象注入跳过：${err?.message || err}`);
             }
             // 压缩过的上下文缺细节：提醒"现在能补就补"，只提醒一次
             try {
@@ -7556,8 +7574,8 @@ function apply(ctx) {
         } catch (err) {
           diag(`社交档案注入失败：${err?.message || err}`);
         }
-        if (!text && !socialText && !handoffText && !recallText && !conflictText && !loreText && !lostDetailText && !dueText && !openingText && !cueText && !rulesForInject && !habitsForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
-        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}${openingText}\u0000${cueText}\u0000${conflictText}\u0000${loreText}\u0000${lostDetailText}\u0000${rulesForInject}\u0000${habitsForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
+        if (!text && !socialText && !handoffText && !recallText && !conflictText && !loreText && !circleText && !lostDetailText && !dueText && !openingText && !cueText && !rulesForInject && !habitsForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
+        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}${openingText}\u0000${cueText}\u0000${conflictText}\u0000${loreText}\u0000${circleText}\u0000${lostDetailText}\u0000${rulesForInject}\u0000${habitsForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
         if (lastInjected.get(sessionId) === digest) {
           if (injectMode === "first-step") injectedOnce.add(sessionId);
           return decision;
@@ -7605,6 +7623,7 @@ function apply(ctx) {
         const cueMessage = cueText ? injectionMessage(cueText) : null;
         const conflictMessage = conflictText ? injectionMessage(conflictText) : null;
         const loreMessage = loreText ? injectionMessage(loreText) : null;
+        const circleMessage = circleText ? injectionMessage(circleText) : null;
         const lostDetailMessage = lostDetailText ? injectionMessage(lostDetailText) : null;
         // v0.41（B-101）自我层：独立预算，不跟核心卡抢；审计按节奏走（有排队先补，没排队等够 N 段再查）
         let selfText = "";
@@ -7631,7 +7650,7 @@ ${selfText}
           : null;
         return {
           kind: "enter",
-          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
+          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
         };
       } catch (err) {
         log("warn", `pre-step 注入失败：${err?.message || err}`);
@@ -8634,6 +8653,58 @@ ${selfText}
           ].join("\n");
         } catch (err) {
           return `世界书操作失败：${err?.message || err}`;
+        }
+      },
+    });
+
+    register({
+      name: "memory_circle",
+      description:
+        "圈子印象（v1.0，2026-11-16）：**按网站/社区**记住「那里的人怎么说话、什么别碰、我怎么看它」——B站、小黑盒、贴吧、知乎、微博、抖音各一条。**零模型成本**：只按名字/别名关键词命中，命中才注入（一次最多 2 个、每个 ≤200 字）。**它不是事实，也不是规则**：只影响表达方式，不参与判定。action=add（name 必填，可带 aliases/tone/taboos/impression）| update（按 id 或 name 改，改完立即生效）| list | remove。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["add", "update", "list", "remove"], description: "默认 list" },
+          id: { type: "string", description: "update / remove 用：圈子 id（可只给前几位）" },
+          name: { type: "string", description: "add 必填：网站/社区名（如「小黑盒」）；update 也可用它定位" },
+          aliases: { type: "string", description: "别名，逗号分隔（如「黑盒,xiaoheihe」）" },
+          tone: { type: "string", description: "那里的人怎么说话（一句话）" },
+          taboos: { type: "string", description: "别碰什么，逗号分隔" },
+          impression: { type: "string", description: "我的印象（一句话，可随时改）" },
+          enabled: { type: "boolean", description: "update 用：false 停用" },
+          includeDisabled: { type: "boolean", description: "list 用：连停用的也列" },
+        },
+        required: ["action"],
+      },
+      output,
+      async execute(args) {
+        try {
+          ensureDirs();
+          const C = circleLayer();
+          const action = String(args?.action || "list");
+          if (action === "add") {
+            const r = C.add({ name: args?.name, aliases: args?.aliases, tone: args?.tone, taboos: args?.taboos, impression: args?.impression });
+            if (!r.ok) return `加不了：${r.error}`;
+            return `已加圈子 ${r.row.id}「${r.row.name}」${r.row.aliases.length ? `（别名：${r.row.aliases.join("、")}）` : ""}。\n文件：${C.file}`;
+          }
+          if (action === "update") {
+            const r = C.update({ id: args?.id, name: args?.name, aliases: args?.aliases, tone: args?.tone, taboos: args?.taboos, impression: args?.impression, enabled: args?.enabled });
+            if (!r.ok) return `改不了：${r.error}`;
+            return `已更新「${r.row.name}」：${r.row.enabled === false ? "已停用" : "生效中"}（下一次提到它就按新的来）。`;
+          }
+          if (action === "remove") {
+            const r = C.remove({ id: args?.id });
+            if (!r.ok) return `删不了：${r.error}`;
+            return `已删 ${r.removed} 条。`;
+          }
+          const list = C.list({ includeDisabled: args?.includeDisabled });
+          if (!list.length) return "还没有圈子印象（用 action=add 加一个网站）。";
+          return [
+            `圈子印象 ${list.length} 条：`,
+            ...list.map((r) => `${r.id}「${r.name}」${r.tone ? `｜${clip(r.tone, 30)}` : ""}${r.taboos?.length ? `｜别碰：${r.taboos.join("、")}` : ""}${r.enabled === false ? "｜已停用" : ""}`),
+          ].join("\n");
+        } catch (err) {
+          return `圈子印象操作失败：${err?.message || err}`;
         }
       },
     });
