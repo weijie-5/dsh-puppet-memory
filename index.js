@@ -1857,9 +1857,8 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
   const maxChars = Math.max(300, total - Math.max(0, Number(coreUsed) || 0));
   const parts = [];
 
-  // v0.37（B-87）：先给「现在」——记忆里有过去、这里没有现在，模型就只能猜「刚才」有多刚
-  const nowLine = formatNowLine();
-  if (nowLine && !(opts.suppressed instanceof Set && opts.suppressed.has("now"))) parts.push(nowLine);
+  // v1.2（2026-11-16）：这一块不再带「现在」——时间每轮都在变，会让注入指纹每轮都不同，
+  // 等于把「只注入一次」变成「每轮重灌」。时间改由单独的 <puppet_now>（10 分钟节流）负责。
   const nowMs = Date.now();
 
   const persona = readText(PATHS.persona)
