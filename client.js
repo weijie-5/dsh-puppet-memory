@@ -207,16 +207,80 @@ window.__ModuleLoader__.load({
     // 页 1：自动摘要（独立设置页）
     // ---------------------------------------------------------------
     // v1.1（2026-11-16）：一页四面——功能 / 备份 / 摘要 / 会话。以前是四个独立设置页，太多。
+    // 记忆设置（总览）：从值班台搬过来，并把三张卡的账列全
+    function OverviewPanel() {
+      const { useState, useEffect, useCallback } = React
+      const [data, setData] = useState(null)
+      const [error, setError] = useState('')
+
+      const load = useCallback(async () => {
+        setError('')
+        try {
+          const res = await callApi('overview')
+          if (!res || res.ok !== true) throw new Error((res && res.error) || '读取失败')
+          setData(res)
+        } catch (err) {
+          setError(err && err.message ? err.message : String(err))
+        }
+      }, [])
+
+      useEffect(() => {
+        load()
+      }, [load])
+
+      if (error) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-error' }, error))
+      if (!data) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-hint' }, '读取中…'))
+
+      const cards = data.cards || []
+      const counts = data.counts || {}
+      const backup = data.backup || {}
+      return h('div', { className: 'pmb' },
+        h('div', { className: 'pmb-title' }, '记忆设置'),
+        h('div', { className: 'pmb-hint' }, '这台机器上的记忆现在长什么样。三张常驻卡的额度、各层条目数、压缩与备份的状态都在这儿。'),
+        h('div', { className: 'pmb-card' },
+          h('div', { className: 'pmb-title' }, '常驻卡'),
+          h('div', { className: 'pmb-grid' },
+            cards.map((c) => h('div', { key: c.id, className: 'pmb-kv' },
+              h('div', { className: 'pmb-k' }, c.label),
+              h('div', { className: 'pmb-v' }, c.chars + ' / ' + c.budget + ' 字'),
+            )),
+          ),
+        ),
+        h('div', { className: 'pmb-card' },
+          h('div', { className: 'pmb-title' }, '条目'),
+          h('div', { className: 'pmb-grid' },
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '关系'), h('div', { className: 'pmb-v' }, String(counts.relations || 0))),
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '用户档案'), h('div', { className: 'pmb-v' }, String(counts.user || 0))),
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '便签'), h('div', { className: 'pmb-v' }, String(counts.memo || 0))),
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '笔记'), h('div', { className: 'pmb-v' }, String(counts.notes || 0))),
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '常言'), h('div', { className: 'pmb-v' }, String(counts.sayings || 0))),
+          ),
+        ),
+        h('div', { className: 'pmb-card' },
+          h('div', { className: 'pmb-title' }, '压缩与备份'),
+          h('div', { className: 'pmb-grid' },
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '累计压缩'), h('div', { className: 'pmb-v' }, String(data.compactions || 0) + ' 次')),
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '上次压缩'), h('div', { className: 'pmb-v' }, data.lastCompactionAt ? fmtLocal(data.lastCompactionAt) : '（还没触发过）')),
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '最近备份'), h('div', { className: 'pmb-v' }, backup.lastAt ? fmtLocal(backup.lastAt) : '（还没备份）')),
+            h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '保留'), h('div', { className: 'pmb-v' }, (backup.keepDays || '-') + ' 天')),
+          ),
+          h('div', { className: 'pmb-sub' }, '数据目录：' + (data.dir || '') + (backup.dir ? '　｜　备份：' + backup.dir : '')),
+        ),
+      )
+    }
+
     function MemorySettingsPanel() {
       const { useState } = React
       const [tab, setTab] = useState('features')
       const tabs = [
+        ['overview', '记忆设置'],
         ['features', '功能开关'],
         ['backup', '备份'],
         ['summary', '自动摘要'],
         ['session', '会话记忆'],
       ]
-      const body = tab === 'features' ? h(FeaturesPanel)
+      const body = tab === 'overview' ? h(OverviewPanel)
+        : tab === 'features' ? h(FeaturesPanel)
         : tab === 'backup' ? h(BackupPanel)
         : tab === 'summary' ? h(AutoSummaryPanel)
         : h(SessionMemoryPanel)
@@ -1243,7 +1307,6 @@ window.__ModuleLoader__.load({
 
       const qq = (data && data.qq) || {}
       const bili = (data && data.bili) || {}
-      const mem = (data && data.memory) || {}
       const quota = qq.quota || {}
 
       return h('div', { className: 'pmb-page' },
@@ -1251,7 +1314,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'pmb' },
         h('div', { className: 'pmb-head' },
           h('div', { className: 'pmb-title' }, '值班台'),
-          h('div', { className: 'pmb-sub' }, '一屏看三样心跳：QQ 观察器 / B站值班 / 记忆。每 30 秒自动刷新。'),
+          h('div', { className: 'pmb-sub' }, '两样心跳：QQ 观察器 / B站值班。记忆的去设置页「记忆设置」看。每 30 秒自动刷新。'),
         ),
         error ? h('div', { className: 'pmb-err' }, error) : null,
         h('div', { className: 'pmb-actions' },
@@ -1271,13 +1334,6 @@ window.__ModuleLoader__.load({
           ['最近报告', bili.lastReport ? (bili.lastReport.file + '（' + bili.lastReport.ago + '）') : '（还没跑过）'],
           ['最近日志', bili.lastLog ? String(bili.lastLog).slice(0, 90) : '（暂无）'],
         ], '报告在 ~/.dsh/bili-duty/out/'),
-        card('记忆', [
-          ['版本', mem.version || '?'],
-          ['核心卡', (mem.coreChars || 0) + ' 字'],
-          ['关系/用户/便签/笔记', (mem.relations || 0) + ' / ' + (mem.user || 0) + ' / ' + (mem.memo || 0) + ' / ' + (mem.notes || 0)],
-          ['累计压缩', (mem.compactions || 0) + ' 次' + (mem.lastCompactionAt ? ('（最近 ' + fmtLocal(mem.lastCompactionAt) + '）') : '')],
-          ['压缩后自检', mem.compactionCheck ? (mem.compactionCheck.ok ? '通过' : '未通过') : '（还没触发过）'],
-        ], '数据在 ~/.dsh/memory，纯文本'),
         qw ? h('div', { className: 'pmb-card' },
           h('div', { className: 'pmb-title' }, '省 token（观察器设置）'),
           h('div', { className: 'pmb-grid' },
