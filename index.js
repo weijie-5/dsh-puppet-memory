@@ -7051,6 +7051,9 @@ function apply(ctx) {
   }
 
   const lastInjected = new Map();
+  // v1.2（2026-11-16）：时间不再每轮塞——同一会话 10 分钟内只注一次（他发得勤时不必知道时间）
+  const lastNowInjected = new Map();
+  const NOW_THROTTLE_MS = 10 * 60 * 1000;
   // 会话级「已注入过一次」标记（inject.mode = first-step 时用）
   const injectedOnce = new Set();
   const seenEvents = new Map();
@@ -7371,6 +7374,19 @@ function apply(ctx) {
         let recallText = "";
         let dueText = "";
         let openingText = "";
+        let nowText = "";
+        try {
+          const prev = lastNowInjected.get(sessionId) || 0;
+          if (!prev || Date.now() - prev >= NOW_THROTTLE_MS) {
+            const line = formatNowLine();
+            if (line) {
+              nowText = `${line}\n（时间只在他隔了 10 分钟以上没说话时才给一次；刚说过话就别提时间。）`;
+              lastNowInjected.set(sessionId, Date.now());
+            }
+          }
+        } catch (err) {
+          diag(`时间行生成失败：${err?.message || err}`);
+        }
         let cueText = "";
         let conflictText = "";
         let loreText = "";
@@ -7610,8 +7626,8 @@ function apply(ctx) {
         } catch (err) {
           diag(`社交档案注入失败：${err?.message || err}`);
         }
-        if (!text && !socialText && !handoffText && !recallText && !conflictText && !loreText && !circleText && !lostDetailText && !dueText && !openingText && !cueText && !rulesForInject && !habitsForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
-        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}${openingText}\u0000${cueText}\u0000${conflictText}\u0000${loreText}\u0000${circleText}\u0000${lostDetailText}\u0000${rulesForInject}\u0000${habitsForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
+        if (!text && !socialText && !handoffText && !recallText && !conflictText && !loreText && !circleText && !lostDetailText && !dueText && !openingText && !cueText && !nowText && !rulesForInject && !habitsForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
+        const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}${openingText}\u0000${cueText}\u0000${nowText}\u0000${conflictText}\u0000${loreText}\u0000${circleText}\u0000${lostDetailText}\u0000${rulesForInject}\u0000${habitsForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
         if (lastInjected.get(sessionId) === digest) {
           if (injectMode === "first-step") injectedOnce.add(sessionId);
           return decision;
@@ -7657,6 +7673,7 @@ function apply(ctx) {
         const dueMessage = dueText ? injectionMessage(dueText) : null;
         const openingMessage = openingText ? injectionMessage(openingText) : null;
         const cueMessage = cueText ? injectionMessage(cueText) : null;
+        const nowMessage = nowText ? injectionMessage(nowText) : null;
         const conflictMessage = conflictText ? injectionMessage(conflictText) : null;
         const loreMessage = loreText ? injectionMessage(loreText) : null;
         const circleMessage = circleText ? injectionMessage(circleText) : null;
@@ -7686,7 +7703,7 @@ ${selfText}
           : null;
         return {
           kind: "enter",
-          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
+          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(nowMessage ? [nowMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
         };
       } catch (err) {
         log("warn", `pre-step 注入失败：${err?.message || err}`);
