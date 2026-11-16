@@ -298,7 +298,7 @@ window.__ModuleLoader__.load({
                         h('button', { className: 'pmb-btn', onClick: () => setEditing(null) }, '取消'),
                       ),
                     )
-                  : h('div', { key: r._i, className: 'pmb-kv', style: { flexWrap: 'nowrap', alignItems: 'center' } },
+                  : h('div', { key: r._i, className: 'pmb-kv', style: { flexDirection: 'row', flexWrap: 'nowrap', alignItems: 'center' } },
                       h('div', { className: 'pmb-k', style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r.label + (r.repeat === 'yearly' ? '（每年）' : '')),
                       h('div', { className: 'pmb-v', style: { flex: '0 0 auto' } }, r.date || (r.lunar ? '农历 ' + r.lunar : '')),
                       h('div', { style: { display: 'flex', gap: 6, flex: '0 0 auto' } },
