@@ -215,6 +215,7 @@ window.__ModuleLoader__.load({
       // 注意：hooks 必须在任何 early return 之前——放下面会让首次渲染和后续渲染的 hook 数量不一致，整页白屏
       const [editing, setEditing] = useState(null)
       const [editDraft, setEditDraft] = useState({ label: '', date: '', lunar: '', note: '' })
+      const [showAllOpening, setShowAllOpening] = useState(false)
 
       const load = useCallback(async () => {
         setError('')
@@ -275,27 +276,41 @@ window.__ModuleLoader__.load({
         h('div', { className: 'pmb-card' },
           h('div', { className: 'pmb-title' }, '开幕表'),
           (data.opening && data.opening.length)
-            ? h('div', { className: 'pmb-grid' },
-                data.opening.map((r, i) => (editing === i
-                  ? h('div', { key: i, className: 'pmb-kv', style: { flexDirection: 'column', alignItems: 'stretch', gap: 6 } },
+            ? (() => {
+                // 近的排前面：有日期的按日期升序，农历放最后；最多显示 10 条，其余折叠
+                const raw = data.opening.map((r, i) => ({ ...r, _i: i }))
+                const sorted = raw.slice().sort((a, b) => {
+                  const da = a.date || '9999-12-31'
+                  const db = b.date || '9999-12-31'
+                  return da < db ? -1 : da > db ? 1 : a._i - b._i
+                })
+                const visible = showAllOpening ? sorted : sorted.slice(0, 10)
+                return h('div', { className: 'pmb-grid' },
+                  visible.map((r) => (editing === r._i
+                  ? h('div', { key: r._i, className: 'pmb-kv', style: { flexDirection: 'column', alignItems: 'stretch', gap: 6 } },
                       h('input', { className: 'pmb-in', value: editDraft.label, placeholder: '名字', onChange: (e) => setEditDraft({ ...editDraft, label: e.target.value }) }),
                       h('input', { className: 'pmb-in', value: editDraft.date, placeholder: '日期 YYYY-MM-DD', onChange: (e) => setEditDraft({ ...editDraft, date: e.target.value }) }),
                       h('input', { className: 'pmb-in', value: editDraft.lunar, placeholder: '农历 MM-DD（可空）', onChange: (e) => setEditDraft({ ...editDraft, lunar: e.target.value }) }),
                       h('input', { className: 'pmb-in', value: editDraft.note, placeholder: '备注（可空）', onChange: (e) => setEditDraft({ ...editDraft, note: e.target.value }) }),
                       h('div', { style: { display: 'flex', gap: 8 } },
-                        h('button', { className: 'pmb-btn pmb-btn-on', onClick: () => saveOpening(i) }, '保存'),
+                        h('button', { className: 'pmb-btn pmb-btn-on', onClick: () => saveOpening(r._i) }, '保存'),
                         h('button', { className: 'pmb-btn', onClick: () => setEditing(null) }, '取消'),
                       ),
                     )
-                  : h('div', { key: i, className: 'pmb-kv' },
-                      h('div', { className: 'pmb-k' }, r.label + (r.repeat === 'yearly' ? '（每年）' : '')),
-                      h('div', { className: 'pmb-v' }, r.date || (r.lunar ? '农历 ' + r.lunar : '')),
-                      h('div', { style: { display: 'flex', gap: 6, marginLeft: 'auto' } },
-                        h('button', { className: 'pmb-btn', onClick: () => startEdit(i, r) }, '编辑'),
-                        h('button', { className: 'pmb-btn', onClick: () => removeOpening(i) }, '删除'),
+                  : h('div', { key: r._i, className: 'pmb-kv', style: { flexWrap: 'nowrap', alignItems: 'center' } },
+                      h('div', { className: 'pmb-k', style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r.label + (r.repeat === 'yearly' ? '（每年）' : '')),
+                      h('div', { className: 'pmb-v', style: { flex: '0 0 auto' } }, r.date || (r.lunar ? '农历 ' + r.lunar : '')),
+                      h('div', { style: { display: 'flex', gap: 6, flex: '0 0 auto' } },
+                        h('button', { className: 'pmb-btn', onClick: () => startEdit(r._i, r) }, '编辑'),
+                        h('button', { className: 'pmb-btn', onClick: () => removeOpening(r._i) }, '删除'),
                       ),
                     ))),
-              )
+                  sorted.length > 10
+                    ? h('button', { className: 'pmb-btn', onClick: () => setShowAllOpening(!showAllOpening) },
+                        showAllOpening ? '收起' : `展开全部（${sorted.length} 条）`)
+                    : null,
+                )
+              })()
             : h('div', { className: 'pmb-hint' }, '表是空的（用 memory_opening add 加一条特殊日子）。'),
           h('div', { className: 'pmb-sub' }, '每天第一次打开时读一次；到点提醒一次。'),
         ),
