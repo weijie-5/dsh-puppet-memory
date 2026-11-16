@@ -285,7 +285,8 @@ window.__ModuleLoader__.load({
                   return da < db ? -1 : da > db ? 1 : a._i - b._i
                 })
                 const visible = showAllOpening ? sorted : sorted.slice(0, 10)
-                return h('div', { className: 'pmb-grid' },
+                // 一条占一整行（不用 pmb-grid 的两列，否则窄屏下日期和按钮会被挤到第二行）
+                return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
                   visible.map((r) => (editing === r._i
                   ? h('div', { key: r._i, className: 'pmb-kv', style: { flexDirection: 'column', alignItems: 'stretch', gap: 6 } },
                       h('input', { className: 'pmb-in', value: editDraft.label, placeholder: '名字', onChange: (e) => setEditDraft({ ...editDraft, label: e.target.value }) }),
