@@ -231,6 +231,21 @@ window.__ModuleLoader__.load({
       if (error) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-error' }, error))
       if (!data) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-hint' }, '读取中…'))
 
+      const [editing, setEditing] = React.useState(null)
+      const [editDraft, setEditDraft] = React.useState({ label: '', date: '', lunar: '', note: '' })
+      const startEdit = (i, r) => {
+        setEditing(i)
+        setEditDraft({ label: r.label || '', date: r.date || '', lunar: r.lunar || '', note: r.note || '' })
+      }
+      const saveOpening = async (i) => {
+        const res = await callApi('opening-update', { index: i, ...editDraft })
+        if (res && res.ok === true) { setEditing(null); setData(res) } else { setError((res && res.error) || '保存失败') }
+      }
+      const removeOpening = async (i) => {
+        if (typeof window !== 'undefined' && !window.confirm('删除这条？删了就没了。')) return
+        const res = await callApi('opening-delete', { index: i })
+        if (res && res.ok === true) setData(res); else setError((res && res.error) || '删除失败')
+      }
       const cards = data.cards || []
       const counts = data.counts || {}
       const backup = data.backup || {}
@@ -260,10 +275,25 @@ window.__ModuleLoader__.load({
           h('div', { className: 'pmb-title' }, '开幕表'),
           (data.opening && data.opening.length)
             ? h('div', { className: 'pmb-grid' },
-                data.opening.map((r, i) => h('div', { key: i, className: 'pmb-kv' },
-                  h('div', { className: 'pmb-k' }, r.label + (r.repeat === 'yearly' ? '（每年）' : '')),
-                  h('div', { className: 'pmb-v' }, (r.date || (r.lunar ? '农历 ' + r.lunar : '')) + (r.note ? '' : '')),
-                )),
+                data.opening.map((r, i) => (editing === i
+                  ? h('div', { key: i, className: 'pmb-kv', style: { flexDirection: 'column', alignItems: 'stretch', gap: 6 } },
+                      h('input', { className: 'pmb-in', value: editDraft.label, placeholder: '名字', onChange: (e) => setEditDraft({ ...editDraft, label: e.target.value }) }),
+                      h('input', { className: 'pmb-in', value: editDraft.date, placeholder: '日期 YYYY-MM-DD', onChange: (e) => setEditDraft({ ...editDraft, date: e.target.value }) }),
+                      h('input', { className: 'pmb-in', value: editDraft.lunar, placeholder: '农历 MM-DD（可空）', onChange: (e) => setEditDraft({ ...editDraft, lunar: e.target.value }) }),
+                      h('input', { className: 'pmb-in', value: editDraft.note, placeholder: '备注（可空）', onChange: (e) => setEditDraft({ ...editDraft, note: e.target.value }) }),
+                      h('div', { style: { display: 'flex', gap: 8 } },
+                        h('button', { className: 'pmb-btn pmb-btn-on', onClick: () => saveOpening(i) }, '保存'),
+                        h('button', { className: 'pmb-btn', onClick: () => setEditing(null) }, '取消'),
+                      ),
+                    )
+                  : h('div', { key: i, className: 'pmb-kv' },
+                      h('div', { className: 'pmb-k' }, r.label + (r.repeat === 'yearly' ? '（每年）' : '')),
+                      h('div', { className: 'pmb-v' }, r.date || (r.lunar ? '农历 ' + r.lunar : '')),
+                      h('div', { style: { display: 'flex', gap: 6, marginLeft: 'auto' } },
+                        h('button', { className: 'pmb-btn', onClick: () => startEdit(i, r) }, '编辑'),
+                        h('button', { className: 'pmb-btn', onClick: () => removeOpening(i) }, '删除'),
+                      ),
+                    ))),
               )
             : h('div', { className: 'pmb-hint' }, '表是空的（用 memory_opening add 加一条特殊日子）。'),
           h('div', { className: 'pmb-sub' }, '每天第一次打开时读一次；到点提醒一次。'),
