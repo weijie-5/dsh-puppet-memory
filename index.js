@@ -1598,7 +1598,7 @@ function openingHashOf(row) {
 }
 
 /** 加一条（一次性提醒 / 每年 / 农历都走这里）。date 或 inDays 二选一；lunar 单独一种。 */
-function addOpeningRow({ date = "", inDays = 0, label = "", note = "", source = "", lunar = "", once = false, repeat = "", kind = "" } = {}) {
+function addOpeningRow({ date = "", inDays = 0, label = "", note = "", source = "", lunar = "", once = false, repeat = "", kind = "", maxReminders = 0 } = {}) {
   const name = String(label || "").trim();
   if (!name) return { ok: false, error: "label 不能为空（这条要提醒什么）" };
   const rows = readOpeningRows();
@@ -1617,6 +1617,7 @@ function addOpeningRow({ date = "", inDays = 0, label = "", note = "", source = 
   if (once) row.once = true;
   if (repeat) row.repeat = String(repeat);
   if (!lunar) row.hash = openingHashOf(row);
+  if (Number(maxReminders) > 0) row.maxReminders = Number(maxReminders);
   const dup = rows.find((r) => r && ((row.hash && r.hash === row.hash) || (!row.hash && r.lunar === row.lunar && r.label === row.label)));
   if (dup) return { ok: true, row: dup, existed: true };
   rows.push(row);
@@ -1771,24 +1772,41 @@ function buildOpeningInjection(cfg, { nowMs = Date.now(), persist = true } = {})
     const diff = Math.round((t - todayMs) / dayMs);
     const oneShot = r.repeat !== "yearly" && !r.lunar && !r.date ? false : r.repeat !== "yearly" && !r.lunar;
     const tail = `${dayNote}${r.note ? `（${clip(String(r.note), 60)}）` : ""}`;
-    if (diff === 0) hits.push(`今天：${r.label}${tail}`);
-    else if (diff > 0 && diff <= Number(opt.lookaheadDays)) hits.push(`还有 ${diff} 天：${day} ${r.label}${dayNote}`);
-    else if (diff < 0 && diff >= -30 && oneShot) hits.push(`错过了 ${-diff} 天：${day} 的提醒：${r.label}${r.note ? `（${clip(String(r.note), 60)}）` : ""}`);
+    if (diff === 0) hits.push({ r, text: `今天：${r.label}${tail}` });
+    else if (diff > 0 && diff <= Number(opt.lookaheadDays)) hits.push({ r, text: `还有 ${diff} 天：${day} ${r.label}${dayNote}` });
+    else if (diff < 0 && diff >= -30 && oneShot) hits.push({ r, text: `错过了 ${-diff} 天：${day} 的提醒：${r.label}${r.note ? `（${clip(String(r.note), 60)}）` : ""}` });
   }
   if (!hits.length) return "";
   if (persist) {
     safe("开幕表标记", () => writeJson(seenPath, { date: today, at: nowISO() }));
     // 已经提示过的一次性行（今天或已错过）从表里删掉——只提醒一次
     safe("开幕表销账", () => {
-      const rest = readOpeningRows().filter((r) => {
-        if (r.repeat === "yearly" || r.lunar) return true;
-        const day = String(r.date || "");
-        return day > today; // 只留还没到的
-      });
+      // v1.2（2026-11-16 丹阳）：一次性照旧「提醒过就删」；常驻行可以设 maxReminders，提醒满次数后自动删。
+      const hitKeys = new Set(hits.map((h) => openingHashOf(h.r)));
+      const rest = [];
+      for (const r of readOpeningRows()) {
+        const key = r.hash || openingHashOf(r);
+        const isOneShot = r.repeat !== "yearly" && !r.lunar;
+        if (isOneShot) {
+          const day = String(r.date || "");
+          if (day > today) rest.push(r); // 还没到的留着
+          continue;
+        }
+        if (hitKeys.has(key)) {
+          const max = Number(r.maxReminders) || 0;
+          if (max > 0) {
+            r.reminds = (Number(r.reminds) || 0) + 1;
+            if (r.reminds >= max) continue; // 满了，删
+          } else {
+            r.reminds = (Number(r.reminds) || 0) + 1;
+          }
+        }
+        rest.push(r);
+      }
       writeOpeningRows(rest);
     });
   }
-  return ["<puppet_opening>", "开幕表（特殊日子 / 一次性提醒，每天第一次打开时读一次；不是用户消息）：", ...hits.slice(0, Math.max(1, Number(opt.maxItems) || 5)), "</puppet_opening>"].join("\n");
+  return ["<puppet_opening>", "开幕表（特殊日子 / 一次性提醒，每天第一次打开时读一次；不是用户消息）：", ...hits.slice(0, Math.max(1, Number(opt.maxItems) || 5)).map((h) => h.text), "</puppet_opening>"].join("\n");
 }
 
 function buildDueInjection(cfg, { nowMs = Date.now(), persist = true } = {}) {
@@ -8405,6 +8423,7 @@ ${selfText}
           note: { type: "string", description: "补充说明（会跟着提醒一起显示）" },
           source: { type: "string", description: "出处：谁说的/依据什么（如「丹阳 2026-11-02 说」）" },
           once: { type: "boolean", description: "add 用：一次性提醒（默认按一次性处理；加 repeat/lunar 才是长期的）" },
+          maxReminders: { type: "number", description: "add 用：提醒满几次后自动删除（仅对 repeat=yearly 这类常驻行有效；0/不填 = 一直留着）" },
           hash: { type: "string", description: "remove 用：条目 hash（可只给前 8 位）" },
         },
       },
@@ -8422,11 +8441,17 @@ ${selfText}
               lunar: args?.lunar,
               once: args?.once === true,
               repeat: args?.repeat,
+              maxReminders: args?.maxReminders,
             });
             if (!res.ok) return `没写上：${res.error}`;
             if (res.existed) return `这条已经在表里了，没重复写：${res.row.label}`;
             const when = res.row.lunar ? `农历 ${res.row.lunar}（每年）` : `${res.row.date}${res.row.repeat === "yearly" ? "（每年）" : ""}`;
-            return `记进开幕表：${when} ${res.row.label}${res.row.once ? "（一次性，提示过就删）" : ""}`;
+            const tail = res.row.once
+              ? "（一次性，提示过就删）"
+              : res.row.maxReminders
+                ? `（提醒满 ${res.row.maxReminders} 次自动删）`
+                : "";
+            return `记进开幕表：${when} ${res.row.label}${tail}`;
           }
           if (action === "remove") {
             const res = removeOpeningRow({ hash: args?.hash, label: args?.label });
