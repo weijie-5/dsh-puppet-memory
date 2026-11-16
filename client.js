@@ -206,6 +206,32 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------
     // 页 1：自动摘要（独立设置页）
     // ---------------------------------------------------------------
+    // v1.1（2026-11-16）：一页四面——功能 / 备份 / 摘要 / 会话。以前是四个独立设置页，太多。
+    function MemorySettingsPanel() {
+      const { useState } = React
+      const [tab, setTab] = useState('features')
+      const tabs = [
+        ['features', '功能开关'],
+        ['backup', '备份'],
+        ['summary', '自动摘要'],
+        ['session', '会话记忆'],
+      ]
+      const body = tab === 'features' ? h(FeaturesPanel)
+        : tab === 'backup' ? h(BackupPanel)
+        : tab === 'summary' ? h(AutoSummaryPanel)
+        : h(SessionMemoryPanel)
+      return h('div', { className: 'pmb' },
+        h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', borderBottom: '1px solid var(--dsw-alias-border-l1)', paddingBottom: 8 } },
+          tabs.map(([id, label]) => h('button', {
+            key: id,
+            className: tab === id ? 'pmb-btn pmb-btn-on' : 'pmb-btn',
+            onClick: () => setTab(id),
+          }, label)),
+        ),
+        body,
+      )
+    }
+
     function FeaturesPanel() {
       const { useState, useEffect, useCallback } = React
       const [items, setItems] = useState(null)
@@ -1355,22 +1381,10 @@ window.__ModuleLoader__.load({
       if (slots === undefined || slots === null) return
       slots.inject('settings.section', () => {
         // 两个独立设置页：一个页面一个 list 条目，互不挤在一起
+        // v1.1：四个页面合并成一页（顶部 tab 切换），设置列表里只占一行
         slots.register(
-          { name: 'settings.section', id: 'puppet-features', order: 25, label: '功能开关' },
-          () => h(FeaturesPanel),
-        )
-        slots.register(
-          { name: 'settings.section', id: 'puppet-backup', order: 26, label: '记忆备份' },
-          () => h(BackupPanel),
-        )
-        slots.register(
-          { name: 'settings.section', id: 'puppet-autosummary', order: 27, label: '自动摘要' },
-          () => h(AutoSummaryPanel),
-        )
-        // v0.28：脏记忆的会话级隔离——屏蔽只影响本会话注入，删除只动本会话片段（先归档）
-        slots.register(
-          { name: 'settings.section', id: 'puppet-session', order: 28, label: '会话记忆' },
-          () => h(SessionMemoryPanel),
+          { name: 'settings.section', id: 'puppet-memory', order: 25, label: '记忆' },
+          () => h(MemorySettingsPanel),
         )
 
         // 值班台：侧栏面板行（sidebar.panellist 才进侧栏列表、才有固定状态）
