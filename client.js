@@ -382,7 +382,7 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'pmb-card' },
         h('div', { className: 'pmb-title' }, '时间提示'),
-        h('div', { className: 'pmb-hint' }, '插件自己的钩子，零模型成本。选一种：隔久才给 / 跟着回忆走 / 两者任一（任一条件满足就给）/ 不给。'),
+        h('div', { className: 'pmb-hint' }, '插件自己的钩子，零模型成本。一次只触发一次；两个条件都没满足，就完全不注入时间。'),
         error ? h('div', { className: 'pmb-error' }, error) : null,
         h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
           h('select', {
@@ -392,8 +392,8 @@ window.__ModuleLoader__.load({
           },
             h('option', { value: 'gap' }, '隔久了才给（默认）'),
             h('option', { value: 'recall' }, '只有翻出旧回忆时才给'),
-            h('option', { value: 'both' }, '两者任一'),
-            h('option', { value: 'off' }, '不给时间'),
+            h('option', { value: 'both' }, '两种都算（隔久 或 回忆，任一满足给一次）'),
+            h('option', { value: 'off' }, '关闭（都不给，这一轮不注入时间）'),
           ),
           h('span', { className: 'pmb-sub' }, '间隔'),
           h('input', {
