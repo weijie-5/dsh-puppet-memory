@@ -693,9 +693,12 @@ function defaultConfig() {
       mode: "every-step",
       // v0.22 核心记忆：behavior/core.md 小文件，默认「缺就补」地每步注入，600 字预算。
       // 它先从 maxChars 总预算里扣，开核心卡不会让注入总量变长；关掉不影响旧行为。
-      core: { enabled: true, maxChars: 600, everyStep: true, state: { enabled: true, maxChars: 150 }, rules: { enabled: true, maxChars: 400 } },
+      core: { enabled: true, maxChars: 600, everyStep: true, state: { enabled: true, maxChars: 150 }, rules: { enabled: true, maxChars: 400 }, levels: { core: "strong", rules: "strong", state: "weak", self: "weak" } },
   // 时间提示（v1.3，2026-11-17）：插件自己的钩子，零模型成本。mode=gap（隔久才给）/ recall（跟着回忆走）/ both / off
   now: { mode: "gap", gapMinutes: 10 },
+  // 四张卡的注入强度（v1.4，2026-11-17 丹阳）：strong=全文 弱=pocket 只留一句提示；
+  // 各自独立指纹、各自节奏——状态/自我不必每次都把正文塞一遍。
+  // 卡片：core=核心卡 / rules=规则卡 / state=状态卡 / self=自我层
     },
     // 备份（v0.12.0）：行为记忆也纳入；自动备份一天最多一次；30 天前的快照自动删。
     backup: {
@@ -1254,7 +1257,9 @@ function coreOptions(cfg) {
   const state = { enabled: stateOpt.enabled !== false, budget: Math.max(60, Number(stateOpt.maxChars) || 150) };
   const rulesOpt = { ...(defaultConfig().inject.core.rules || {}), ...((opt && opt.rules) || {}) };
   const rules = { enabled: rulesOpt.enabled !== false, budget: Math.max(100, Number(rulesOpt.maxChars) || 400) };
-  return { enabled: opt.enabled !== false, budget, everyStep: opt.everyStep !== false, state, rules };
+  const levelsRaw = { ...(defaultConfig().inject.core.levels || {}), ...((opt && opt.levels) || {}) };
+  const levels = { core: levelsRaw.core === "weak" ? "weak" : "strong", rules: levelsRaw.rules === "weak" ? "weak" : "strong", state: levelsRaw.state === "weak" ? "weak" : "strong", self: levelsRaw.self === "weak" ? "weak" : "strong" };
+  return { enabled: opt.enabled !== false, budget, everyStep: opt.everyStep !== false, state, rules, levels };
 }
 
 function coreInjection(cfg) {
@@ -1267,10 +1272,21 @@ function coreInjection(cfg) {
   const rawRules = opt.rules.enabled ? readMd(PATHS.coreRules) : "";
   const rawState = opt.state.enabled ? readMd(PATHS.coreState) : "";
   if (!rawCore && !rawRules && !rawState) return empty;
-  const corePart = clipTo(rawCore, opt.budget);
-  const rulesPart = clipTo(rawRules, opt.rules.budget);
-  const statePart = clipTo(rawState, opt.state.budget);
-  // v0.33：规则 / 稳定内容 / 状态三份，各自预算、各自截断；调用方也按三段各自算指纹
+  // v1.4（2026-11-17）：强补充=全文；弱补充=只留一句提示（省上下文，需要时用 memory_core 取全文）
+  const weakHint = (label, raw, target) => {
+    const chars = String(raw || "").replace(/\s+/g, "").length;
+    if (!chars) return "";
+    return `（${label}有 ${chars} 字，这一轮按弱补充只给提示；需要细节用 memory_core action=get target=${target}。）`;
+  };
+  const corePart = opt.levels.core === "weak"
+    ? { text: weakHint("核心卡", rawCore, "core"), clipped: false }
+    : clipTo(rawCore, opt.budget);
+  const rulesPart = opt.levels.rules === "weak"
+    ? { text: weakHint("规则卡", rawRules, "rules"), clipped: false }
+    : clipTo(rawRules, opt.rules.budget);
+  const statePart = opt.levels.state === "weak"
+    ? { text: weakHint("状态卡", rawState, "state"), clipped: false }
+    : clipTo(rawState, opt.state.budget);
   const parts = [];
   if (rulesPart.text) parts.push(rulesPart.text);
   if (corePart.text) parts.push(corePart.text);
@@ -7867,7 +7883,13 @@ function apply(ctx) {
               const t = selfLayer().tick({ everyN: sc.audit.everyN, fixPerTurn: sc.audit.fixPerTurn });
               if (t && (t.audited || (t.repaired && t.repaired.length))) diag(`自我层节奏：${JSON.stringify(t)}`);
             }
-            selfText = selfLayer().injectText((sc.inject && sc.inject.maxChars) || 400);
+            const selfLevel = String((((cfg.inject || {}).core || {}).levels || {}).self || "weak");
+            if (selfLevel === "weak") {
+              // 弱补充：不搬正文，只提醒"有这么一层"——需要时 memory_self list 取
+              selfText = "（自我层按弱补充：只提醒到这里，需要时用 memory_self action=list 看具体条目。）";
+            } else {
+              selfText = selfLayer().injectText((sc.inject && sc.inject.maxChars) || 400);
+            }
           }
         } catch (err) {
           diag(`自我层注入失败：${err?.message || err}`);
