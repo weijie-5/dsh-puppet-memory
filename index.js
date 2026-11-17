@@ -7746,6 +7746,7 @@ function apply(ctx) {
         let cueText = "";
         let conflictText = "";
         let loreText = "";
+        let sayingText = "";
         let circleText = "";
         let lostDetailText = "";
         try {
@@ -7778,6 +7779,36 @@ function apply(ctx) {
               }
             } catch (err) {
               diag(`世界书注入跳过：${err?.message || err}`);
+            }
+            // 常言（v1.8，2026-11-17）：本质也是知识——命中才补，上下文已覆盖就不补
+            try {
+              const ctxForSaying = contextTextOf(decision.messages || []);
+              const hits = [];
+              for (const r of readJsonl(PATHS.sayings)) {
+                if (!r || r.voided || r.enabled === false) continue;
+                const kw = String(r.keyword || "");
+                if (!kw || !userText.includes(kw)) continue;
+                if (r.until) {
+                  const t = Date.parse(String(r.until));
+                  if (Number.isFinite(t) && t < Date.now()) continue; // 过期的常言不再注入
+                }
+                const body = String(r.meaning || r.text || "");
+                if (!body) continue;
+                if (missingRatioOf(body, ctxForSaying, 16) <= 0.2) continue; // 已经在了
+                hits.push(`- ${kw}：${clip(body, 90)}`);
+                if (hits.length >= 2) break;
+              }
+              if (hits.length) {
+                sayingText = [
+                  "<puppet_saying>",
+                  "常言（本质是知识：谁说过什么、什么梗怎么来的；不是规则）：",
+                  ...hits,
+                  "</puppet_saying>",
+                ].join("\n");
+                diag(`常言补充：${hits.length} 条`);
+              }
+            } catch (err) {
+              diag(`常言注入跳过：${err?.message || err}`);
             }
             // 圈子印象：当前话题提到哪个网站，就带那里的"怎么说话"
             try {
@@ -8073,6 +8104,7 @@ function apply(ctx) {
         const nowMessage = nowText ? injectionMessage(nowText) : null;
         const conflictMessage = conflictText ? injectionMessage(conflictText) : null;
         const loreMessage = loreText ? injectionMessage(loreText) : null;
+        const sayingMessage = sayingText ? injectionMessage(sayingText) : null;
         const circleMessage = circleText ? injectionMessage(circleText) : null;
         const lostDetailMessage = lostDetailText ? injectionMessage(lostDetailText) : null;
         // v0.41（B-101）自我层：独立预算，不跟核心卡抢；审计按节奏走（有排队先补，没排队等够 N 段再查）
@@ -8115,7 +8147,7 @@ ${selfText}
           : null;
         return {
           kind: "enter",
-          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(nowMessage ? [nowMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
+          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(nowMessage ? [nowMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(sayingMessage ? [sayingMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
         };
       } catch (err) {
         log("warn", `pre-step 注入失败：${err?.message || err}`);
