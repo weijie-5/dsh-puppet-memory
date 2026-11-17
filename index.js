@@ -1958,16 +1958,35 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
   // v1.6（2026-11-17）：补充层按层注入——只补缺的那几层，别整块重灌
   const only = opts.only instanceof Set && opts.only.size ? opts.only : null;
   const want = (layer) => (!only || only.has(layer)) && !suppressed.has(layer);
-  if (persona && want("persona")) parts.push(`【人设】${clip(persona, Math.round(maxChars * 0.3))}`);
+  // v1.8（2026-11-17 丹阳）：提示层「查全文、只注几句」——compact 时每层只留几句
+  const compact = opts.compact === true;
+  const fewSentences = (raw, max = 90) => {
+    const t = String(raw || "").replace(/\s+/g, " ").trim();
+    if (!t) return "";
+    const parts2 = t.split(/(?<=[。；！？!?;])/).map((x) => x.trim()).filter(Boolean);
+    let out = "";
+    for (const p2 of parts2) {
+      if (out.length + p2.length > max) break;
+      out += p2;
+    }
+    return out || clip(t, max);
+  };
+  if (persona && want("persona")) parts.push(`【人设】${compact ? fewSentences(persona, 80) : clip(persona, Math.round(maxChars * 0.3))}`);
 
   // v0.23：陪伴取向时多给关系记忆一点预算；工作/学习取向时按话题给对应的近料
   const primary = lines && lines.primary ? lines.primary : "balanced";
   const { kept: relLines, budget } = relationInjectionLines(cfg, primary === "companion" ? 0.62 : 0.5, suppressed, opts.queryText || "");
-  if (relLines.length && want("relations")) parts.push(`【关系】${clip(relLines.join("；"), budget)}`);
+  if (relLines.length && want("relations")) {
+    const body = compact ? relLines.slice(0, 2).map((l) => clip(l, 36)).join("；") : clip(relLines.join("；"), budget);
+    parts.push(`【关系】${body}`);
+  }
 
   const notes = tailJsonl(PATHS.notes, 6).filter((n) => !suppressed.has(String(n?.hash || "")) && !n?.voided);
   if (notes.length && want("notes")) {
-    parts.push(`【最近笔记】${clip(notes.map((n) => n.text).join("；"), primary === "learning" ? 420 : 320)}`);
+    const noteBody = compact
+      ? notes.slice(0, 2).map((n) => clip(n.text, 40)).join("；")
+      : clip(notes.map((n) => n.text).join("；"), primary === "learning" ? 420 : 320);
+    parts.push(`【最近笔记】${noteBody}`);
   }
 
   // v0.23：工作取向时把最近一条便签（工作交接/待办）提前给出来，别让模型抓瞎
@@ -7704,11 +7723,13 @@ function apply(ctx) {
           }
           supLayerPlan.set(sessionId, supPlan);
           if (chosen.length) {
+            // 压缩后那一轮给全量（位置在开头、注意力足）；平时只给几句
             text = buildInjectionText(cfg, coreText ? core.length : 0, linesView, {
               suppressed,
               only: new Set(chosen),
               skipDiary: !chosen.includes("diary"),
               queryText: queryForLayers,
+              compact: !justCompressed,
             });
             diag(`补充层注入：${chosen.join("+")}（turn=${supPlan.turn}${justCompressed ? "，压缩后" : ""}）`);
           }
