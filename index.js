@@ -1360,7 +1360,7 @@ function coreInjection(cfg) {
   const parts = [];
   if (rulesPart.text) parts.push(rulesPart.text);
   if (corePart.text) parts.push(corePart.text);
-  if (statePart.text) parts.push(`【当前状态】\n${statePart.text}`);
+  if (statePart.text) parts.push(`【事实状态（主线/进度/待办，不是互动取向）】\n${statePart.text}`);
   const text = parts.join("\n");
   return { text, length: text.length, clipped: corePart.clipped, budget: opt.budget, rawCore, rawRules, rawState, coreText: corePart.text, rulesText: rulesPart.text, stateText: statePart.text, rulesLength: rulesPart.text.length, stateLength: statePart.text.length, rulesClipped: rulesPart.clipped, stateClipped: statePart.clipped, rulesBudget: opt.rules.budget, stateBudget: opt.state.budget, everyStep: opt.everyStep };
 }
@@ -1604,7 +1604,7 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now(), collect } = {
   ].join("\n");
   try {
     if (collect && Array.isArray(collect)) {
-      for (const h of hits) if (h.hash) collect.push(String(h.hash));
+      for (const h of hits) if (h.hash) collect.push({ layer: h.layer, hash: String(h.hash) });
     }
   } catch {}
 
@@ -1990,8 +1990,9 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
 
   // v1.8（2026-11-17）：【工作日志】是自动转存的上下文残片，不是可用笔记——注入时跳过（数据留着）
   const isWorkLog = (n) => /^【工作日志/.test(String(n?.text || ""));
+  const excludeNotes = opts.excludeNoteHashes instanceof Set ? opts.excludeNoteHashes : null;
   const notes = tailJsonl(PATHS.notes, 24)
-    .filter((n) => !suppressed.has(String(n?.hash || "")) && !n?.voided && !isWorkLog(n))
+    .filter((n) => !suppressed.has(String(n?.hash || "")) && !n?.voided && !isWorkLog(n) && !(excludeNotes && excludeNotes.has(String(n?.hash || ""))))
     .slice(-6);
   if (notes.length && want("notes")) {
     const noteBody = compact
@@ -7359,6 +7360,7 @@ function apply(ctx) {
   const pendingStrong = new Map(); // sessionId -> true：刚压缩过，下一步做一次强补充
   const supLayerPlan = new Map(); // sessionId -> { turn, check }：补充层每 8 轮查一次
   const recentRelInjected = new Map(); // sessionId -> Map(hash -> turn)：5 轮内别重复注入同一条关系
+  const recentNoteInjected = new Map(); // 同上，针对笔记（取词器已按标签命中过的不再当"最近笔记"重来）
   const lastRulesInjected = new Map();
   const lastCoreStateInjected = new Map();
   // v0.33（B-47）：一句话复位的一次性临时约束，按会话存、注入一次即删，不落任何文件
@@ -7741,6 +7743,7 @@ function apply(ctx) {
             text = buildInjectionText(cfg, coreText ? core.length : 0, linesView, {
               suppressed,
               excludeRelationHashes: excludeRel,
+              excludeNoteHashes: new Set((recentNoteInjected.get(sessionId) || new Map()).keys()),
               only: new Set(chosen),
               skipDiary: !chosen.includes("diary"),
               queryText: queryForLayers,
@@ -7775,11 +7778,15 @@ function apply(ctx) {
             const relHashes = [];
             recallText = buildRecallInjection(cfgLive, userText, { collect: relHashes });
             if (relHashes.length) {
-              const m = recentRelInjected.get(sessionId) || new Map();
               const turnNow = (cardPlan.get(sessionId) || {}).turn || 0;
-              for (const h of relHashes) m.set(h, turnNow);
-              for (const [k, t] of m) if (turnNow - t > 5) m.delete(k);
-              recentRelInjected.set(sessionId, m);
+              const bump = (mapName, layer) => {
+                const m = (mapName === "rel" ? recentRelInjected : recentNoteInjected).get(sessionId) || new Map();
+                for (const h of relHashes) if (h.layer === layer) m.set(h.hash, turnNow);
+                for (const [k, t] of m) if (turnNow - t > 5) m.delete(k);
+                (mapName === "rel" ? recentRelInjected : recentNoteInjected).set(sessionId, m);
+              };
+              bump("rel", "relation");
+              bump("note", "note");
             }
             // 冲突核对：只查"当前说法 vs 旧记忆"的事实矛盾；命中才注入一张短卡
             if (!suppressed.has("conflict")) {
