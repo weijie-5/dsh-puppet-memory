@@ -1250,6 +1250,38 @@ function archiveRelationOverflow(cfg) {
 
 // v0.22：核心记忆小文件。它是「常驻卡」不是日记——只放称呼约定、风格红线、
 // 当前主线、绝对不能忘的事。读的时候按预算截断，截了就明确标出来。
+// v1.4（2026-11-17）：卡片的「缺失比例」——按 12 字滑窗看当前上下文里还剩多少
+function contextTextOf(messages) {
+  try {
+    const arr = Array.isArray(messages) ? messages : [];
+    const parts = [];
+    for (const m of arr.slice(-40)) {
+      const c = m && m.content;
+      if (typeof c === "string") parts.push(c);
+      else if (Array.isArray(c)) {
+        for (const p of c) if (p && typeof p.text === "string") parts.push(p.text);
+      }
+    }
+    return parts.join("\n");
+  } catch {
+    return "";
+  }
+}
+
+function missingRatioOf(cardText, ctxText, size = 12) {
+  const card = String(cardText || "").replace(/\s+/g, "");
+  const ctx = String(ctxText || "").replace(/\s+/g, "");
+  if (!card) return 0;
+  if (!ctx) return 1;
+  const n = card.length - size + 1;
+  if (n <= 0) return ctx.includes(card) ? 0 : 1;
+  let miss = 0;
+  for (let i = 0; i < n; i += 1) {
+    if (!ctx.includes(card.slice(i, i + size))) miss += 1;
+  }
+  return miss / n;
+}
+
 function coreOptions(cfg) {
   const opt = { ...defaultConfig().inject.core, ...((cfg && cfg.inject && cfg.inject.core) || {}) };
   const budget = Math.max(100, Number(opt.maxChars) || 600);
@@ -1292,7 +1324,7 @@ function coreInjection(cfg) {
   if (corePart.text) parts.push(corePart.text);
   if (statePart.text) parts.push(`【当前状态】\n${statePart.text}`);
   const text = parts.join("\n");
-  return { text, length: text.length, clipped: corePart.clipped, budget: opt.budget, coreText: corePart.text, rulesText: rulesPart.text, stateText: statePart.text, rulesLength: rulesPart.text.length, stateLength: statePart.text.length, rulesClipped: rulesPart.clipped, stateClipped: statePart.clipped, rulesBudget: opt.rules.budget, stateBudget: opt.state.budget, everyStep: opt.everyStep };
+  return { text, length: text.length, clipped: corePart.clipped, budget: opt.budget, rawCore, rawRules, rawState, coreText: corePart.text, rulesText: rulesPart.text, stateText: statePart.text, rulesLength: rulesPart.text.length, stateLength: statePart.text.length, rulesClipped: rulesPart.clipped, stateClipped: statePart.clipped, rulesBudget: opt.rules.budget, stateBudget: opt.state.budget, everyStep: opt.everyStep };
 }
 
 // v0.28：会话记忆管理单例（屏蔽表 + 本会话片段删除）。MEM_DIR 在模块加载时固定，单例安全。
@@ -7251,6 +7283,9 @@ function apply(ctx) {
   const compactionProbeDone = new Set();
   // v0.22：核心卡上次注入的指纹（内容没变就不重复往上下文里塞同一条）
   const lastCoreInjected = new Map();
+  // v1.4（2026-11-17）四张卡各有自己的节奏：turn 计数、上次检查的轮次
+  const cardPlan = new Map(); // sessionId -> { turn, core, rules, state, self }
+  const pendingStrong = new Map(); // sessionId -> true：刚压缩过，下一步做一次强补充
   const lastRulesInjected = new Map();
   const lastCoreStateInjected = new Map();
   // v0.33（B-47）：一句话复位的一次性临时约束，按会话存、注入一次即删，不落任何文件
@@ -7282,6 +7317,9 @@ function apply(ctx) {
     lastRulesInjected.delete(sessionId);
     lastCoreStateInjected.delete(sessionId);
     lastStateInjected.delete(sessionId);
+    // 压缩后位置在上下文开头、注意力最足——下一次做一次强补充，之后回到弱补充
+    pendingStrong.set(sessionId, true);
+    cardPlan.delete(sessionId);
     backupAsync("compress");
     // 压缩后补一条自动摘要（二期）：上下文刚被压过，说明这段对话长且重要
     scheduleAutoSummary({ session: sessionRefs.get(sessionId) || null }, sessionId, "compaction", 5000);
@@ -7517,11 +7555,10 @@ function apply(ctx) {
         }
         const core = coreInjection(cfg);
         const coreAllowed = core.text && (!firstStepDone || core.everyStep) && !suppressed.has("core");
-        // v0.33：规则 / 稳定内容 / 状态三段各自算指纹——状态一变不会把规则再提醒一遍，
-        // 规则只在「内容改过」或「压缩后指纹被清」时各注入一次。
-        const rulesDigest = coreAllowed && core.rulesText ? sha1(core.rulesText) : "";
-        const coreDigest = coreAllowed && core.coreText ? sha1(core.coreText) : "";
-        const coreStateDigest = coreAllowed && core.stateText ? sha1(core.stateText) : "";
+        // v1.4（2026-11-17 丹阳定的节奏）：四张卡各走各的班次——
+        //   压缩后：先做一次「强补充」（此时在上下文开头，注意力最足）；
+        //   平时：只有轮到自己检查、且缺得够多才强补充，否则只给一句弱提示。
+        //   核心卡/自我层 每 5 轮查一次，缺 >20% 才强补；规则卡 每 10 轮，缺 >10%；状态卡 每 20 轮（或有工具调用时），只弱提示。
         const habitsForInject = (() => {
           try {
             const rows = learnLayer().payHabits();
@@ -7530,9 +7567,58 @@ function apply(ctx) {
             return "";
           }
         })();
-        const rulesForInject = rulesDigest && lastRulesInjected.get(sessionId) !== rulesDigest ? core.rulesText : "";
-        const coreText = coreDigest && lastCoreInjected.get(sessionId) !== coreDigest ? core.coreText : "";
-        const coreStateForInject = coreStateDigest && lastCoreStateInjected.get(sessionId) !== coreStateDigest ? core.stateText : "";
+        const weakHintOf = (label, raw, target) => {
+          const chars = String(raw || "").replace(/\s+/g, "").length;
+          if (!chars) return "";
+          return `（${label} ${chars} 字，这轮只给提示；要用细节就 memory_core action=get target=${target}。）`;
+        };
+        const fullOf = (raw, budget) => {
+          const t = String(raw || "");
+          return t.length > budget ? t.slice(0, budget).trimEnd() : t;
+        };
+        const ctxNow = contextTextOf(decision.messages || []);
+        const hasToolCall = (() => {
+          try {
+            const last = (decision.messages || []).slice(-2);
+            return last.some((m) => Array.isArray(m && m.content) && m.content.some((p) => p && (p.type === "tool_use" || p.type === "tool-result" || p.type === "tool_result")));
+          } catch {
+            return false;
+          }
+        })();
+        const plan = cardPlan.get(sessionId) || { turn: 0, core: 0, rules: 0, state: 0, self: 0 };
+        plan.turn += 1;
+        const justCompressed = pendingStrong.get(sessionId) === true;
+        if (justCompressed) pendingStrong.delete(sessionId);
+        const cardPolicy = {
+          core: { every: 5, thr: 0.2 },
+          rules: { every: 10, thr: 0.1 },
+          state: { every: 20, thr: 0.1, weakOnly: true, toolTrigger: true },
+        };
+        const decide = (id, raw) => {
+          const p = cardPolicy[id];
+          if (!raw) return "skip";
+          if (justCompressed) return id === "state" ? "weak" : "strong";
+          const due = plan.turn - (plan[id] || 0) >= p.every || (p.toolTrigger && hasToolCall);
+          if (!due) return "weak";
+          plan[id] = plan.turn;
+          const miss = missingRatioOf(raw, ctxNow);
+          if (p.weakOnly) return "weak";
+          return miss >= p.thr ? "strong" : "weak";
+        };
+        const modeCore = decide("core", core.rawCore);
+        const modeRules = decide("rules", core.rawRules);
+        const modeState = decide("state", core.rawState);
+        cardPlan.set(sessionId, plan);
+        diag(`卡片节奏 turn=${plan.turn} core=${modeCore} rules=${modeRules} state=${modeState}${justCompressed ? "（压缩后强补充）" : ""}`);
+        const rulesForInject = !coreAllowed ? "" : modeRules === "strong"
+          ? fullOf(core.rawRules, core.rulesBudget)
+          : modeRules === "weak" ? weakHintOf("规则卡", core.rawRules, "rules") : "";
+        const coreText = !coreAllowed ? "" : modeCore === "strong"
+          ? fullOf(core.rawCore, core.budget)
+          : modeCore === "weak" ? weakHintOf("核心卡", core.rawCore, "core") : "";
+        const coreStateForInject = !coreAllowed ? "" : modeState === "strong"
+          ? fullOf(core.rawState, core.stateBudget)
+          : modeState === "weak" ? weakHintOf("状态卡", core.rawState, "state") : "";
         // B-47：复位时若带了一句临时约束，这一步跟着三张卡一起注入，之后删除（只生效一次）
         const resetNote = sessionResetNotes.get(sessionId) || "";
         // v0.23 三线状态：先吃这条用户发言的信号（衰减/锚点/工作日志都在里面），再决定取向
@@ -7883,12 +7969,21 @@ function apply(ctx) {
               const t = selfLayer().tick({ everyN: sc.audit.everyN, fixPerTurn: sc.audit.fixPerTurn });
               if (t && (t.audited || (t.repaired && t.repaired.length))) diag(`自我层节奏：${JSON.stringify(t)}`);
             }
-            const selfLevel = String((((cfg.inject || {}).core || {}).levels || {}).self || "weak");
-            if (selfLevel === "weak") {
-              // 弱补充：不搬正文，只提醒"有这么一层"——需要时 memory_self list 取
-              selfText = "（自我层按弱补充：只提醒到这里，需要时用 memory_self action=list 看具体条目。）";
+            // 自我层跟核心卡同节奏：压缩后强补充一次；每 5 轮查一次，缺 >20% 才强补，否则只提醒
+            const selfFull = selfLayer().injectText((sc.inject && sc.inject.maxChars) || 400);
+            const planNow = cardPlan.get(sessionId) || { turn: 0, self: 0 };
+            const selfDue = planNow.turn - (planNow.self || 0) >= 5;
+            const selfCtx = contextTextOf(decision.messages || []);
+            if (justCompressed) {
+              selfText = selfFull;
+            } else if (selfDue) {
+              planNow.self = planNow.turn;
+              cardPlan.set(sessionId, planNow);
+              selfText = missingRatioOf(selfFull, selfCtx) >= 0.2
+                ? selfFull
+                : "（自我层按弱补充：只提醒到这里，需要时用 memory_self action=list 看具体条目。）";
             } else {
-              selfText = selfLayer().injectText((sc.inject && sc.inject.maxChars) || 400);
+              selfText = "（自我层按弱补充：只提醒到这里，需要时用 memory_self action=list 看具体条目。）";
             }
           }
         } catch (err) {
