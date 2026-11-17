@@ -1937,7 +1937,8 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
   }
 
   // 日记：重要事件（important:true）优先占位，再用最近日记补齐，最多 4 条
-  const diaryFiles = dirJsonl(PATHS.diaryDir);
+  // v1.5（2026-11-17 丹阳）：日记本身≈压缩过的上下文，压缩后不再补它——补了是重复
+  const diaryFiles = opts.skipDiary ? [] : dirJsonl(PATHS.diaryDir);
   const recentDiaries = (diaryFiles.length ? tailJsonl(diaryFiles[diaryFiles.length - 1], 40) : []).filter(
     (d) => !suppressed.has(String(d?.hash || "")) && !d?.voided,
   );
@@ -7636,7 +7637,9 @@ function apply(ctx) {
         // 取向没变就不重复塞（但压缩后会清指纹，自动补回）
         const stateForInject = stateText && !suppressed.has("state") && lastStateInjected.get(sessionId) !== stateDigest ? stateText : "";
         // 完整摘要（人设+关系+笔记+日记）：mode=first-step 时只在第一次注入
-        const text = firstStepDone ? "" : buildInjectionText(cfg, coreText ? core.length : 0, linesView, { suppressed });
+        const text = firstStepDone
+          ? ""
+          : buildInjectionText(cfg, coreText ? core.length : 0, linesView, { suppressed, skipDiary: justCompressed });
         // v0.37（B-84 / B-88）：事件触发取记忆 + open 交接纸条。各自独立成块，内容不变不重复。
         let handoffText = "";
         let recallText = "";
