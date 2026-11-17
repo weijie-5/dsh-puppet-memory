@@ -694,6 +694,8 @@ function defaultConfig() {
       // v0.22 核心记忆：behavior/core.md 小文件，默认「缺就补」地每步注入，600 字预算。
       // 它先从 maxChars 总预算里扣，开核心卡不会让注入总量变长；关掉不影响旧行为。
       core: { enabled: true, maxChars: 600, everyStep: true, state: { enabled: true, maxChars: 150 }, rules: { enabled: true, maxChars: 400 } },
+  // 时间提示（v1.3，2026-11-17）：插件自己的钩子，零模型成本。mode=gap（隔久才给）/ recall（跟着回忆走）/ both / off
+  now: { mode: "gap", gapMinutes: 10 },
     },
     // 备份（v0.12.0）：行为记忆也纳入；自动备份一天最多一次；30 天前的快照自动删。
     backup: {
@@ -2464,6 +2466,7 @@ function memoryOverview() {
         return [];
       }
     })(),
+    now: nowView(),
     compactions: Number(st.compaction && st.compaction.count) || 0,
     lastCompactionAt: (st.compaction && st.compaction.lastAt) || "",
     backup: backup
@@ -2477,6 +2480,32 @@ function memoryOverview() {
         }
       : null,
   };
+}
+
+// 时间提示的开关（面板用）：gap / recall / both / off
+function nowView() {
+  const cfg = loadConfig();
+  const n = { mode: "gap", gapMinutes: 10, ...(cfg.now || {}) };
+  return { ok: true, mode: String(n.mode || "gap"), gapMinutes: Number(n.gapMinutes) || 10 };
+}
+
+function updateNowMode({ mode, gapMinutes } = {}) {
+  const ok = ["gap", "recall", "both", "off"];
+  const cfg = loadConfig();
+  const next = { mode: "gap", gapMinutes: 10, ...(cfg.now || {}) };
+  if (mode !== undefined) {
+    const m = String(mode);
+    if (!ok.includes(m)) return { ok: false, error: `mode 只能是 ${ok.join(" / ")}` };
+    next.mode = m;
+  }
+  if (gapMinutes !== undefined) {
+    const g = Number(gapMinutes);
+    if (!Number.isFinite(g) || g < 1 || g > 1440) return { ok: false, error: "gapMinutes 要在 1–1440 之间" };
+    next.gapMinutes = g;
+  }
+  cfg.now = next;
+  saveConfig(cfg);
+  return { ok: true, ...nowView() };
 }
 
 function setFeature(id, enabled) {
@@ -2712,6 +2741,7 @@ function registerBackupApi(service) {
         if (action === "duty-board") return sendJson(res, dutyBoardData());
         if (action === "features") return sendJson(res, featuresView());
         if (action === "overview") return sendJson(res, memoryOverview());
+        if (action === "now") return sendJson(res, nowView());
         if (action === "qq-watch") return sendJson(res, qqWatchView());
         if (action === "session-memory") {
           const mem = sessionMemory();
@@ -2751,6 +2781,10 @@ function registerBackupApi(service) {
       }
       if (action === "opening-delete") {
         const r = openingDelete(body || {});
+        return sendJson(res, r, r.ok ? 200 : 400);
+      }
+      if (action === "now") {
+        const r = updateNowMode(body || {});
         return sendJson(res, r, r.ok ? 200 : 400);
       }
       if (action === "save-feature") {
@@ -7507,18 +7541,6 @@ function apply(ctx) {
         let dueText = "";
         let openingText = "";
         let nowText = "";
-        try {
-          const prev = lastNowInjected.get(sessionId) || 0;
-          if (!prev || Date.now() - prev >= NOW_THROTTLE_MS) {
-            const line = formatNowLine();
-            if (line) {
-              nowText = `${line}\n（时间只在他隔了 10 分钟以上没说话时才给一次；刚说过话就别提时间。）`;
-              lastNowInjected.set(sessionId, Date.now());
-            }
-          }
-        } catch (err) {
-          diag(`时间行生成失败：${err?.message || err}`);
-        }
         let cueText = "";
         let conflictText = "";
         let loreText = "";
@@ -7805,6 +7827,31 @@ function apply(ctx) {
         const dueMessage = dueText ? injectionMessage(dueText) : null;
         const openingMessage = openingText ? injectionMessage(openingText) : null;
         const cueMessage = cueText ? injectionMessage(cueText) : null;
+        // 时间提示：插件自己的钩子（零模型）。gap=隔久才给；recall=跟着回忆走；both=两者任一；off=不给
+        try {
+          const nowCfg = { mode: "gap", gapMinutes: 10, ...((loadConfig() || {}).now || {}) };
+          const mode = String(nowCfg.mode || "gap");
+          const gapMs = Math.max(1, Number(nowCfg.gapMinutes) || 10) * 60000;
+          const prev = lastNowInjected.get(sessionId) || 0;
+          const gapOk = !prev || Date.now() - prev >= gapMs;
+          const recallOk = Boolean(recallText);
+          const fire = mode === "off" ? false
+            : mode === "recall" ? recallOk
+            : mode === "both" ? (recallOk || gapOk)
+            : gapOk;
+          if (fire) {
+            const line = formatNowLine();
+            if (line) {
+              const why = mode === "recall" ? "这次是因为想起了旧事，顺手把时间给你"
+                : mode === "both" ? "离上次说话够久，或这次翻出了旧事"
+                : `他隔了 ${Math.round(gapMs / 60000)} 分钟以上没说话`;
+              nowText = `${line}\n（${why}；刚聊过的内容不用再提时间。）`;
+              lastNowInjected.set(sessionId, Date.now());
+            }
+          }
+        } catch (err) {
+          diag(`时间行生成失败：${err?.message || err}`);
+        }
         const nowMessage = nowText ? injectionMessage(nowText) : null;
         const conflictMessage = conflictText ? injectionMessage(conflictText) : null;
         const loreMessage = loreText ? injectionMessage(loreText) : null;
@@ -9563,6 +9610,6 @@ const plugin = {
   apply,
 };
 
-export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, addOpeningRow, removeOpeningRow, readOpeningRows, pruneOpeningRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, featuresView, setFeature, memoryOverview, openingUpdate, openingDelete, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
+export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, addOpeningRow, removeOpeningRow, readOpeningRows, pruneOpeningRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, featuresView, setFeature, memoryOverview, openingUpdate, openingDelete, nowView, updateNowMode, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
 export default plugin;
 
