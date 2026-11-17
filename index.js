@@ -1516,8 +1516,11 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now(), collect } = {
   const dayStats = { n: 0, days: 0, grams: 0 };
   try {
     if (rec.daySearch !== false) {
-      const ds = parseDaySpans(String(userText || ""), nowMs);
-      if (ds.spans.length) {
+      // v1.9：命不中就放宽——三轮，还没命中就放弃（人会记错日子，但不会错到没边）
+      for (let level = 1; level <= 3; level += 1) {
+        const ds = parseDaySpans(String(userText || ""), nowMs, level);
+        if (!ds.spans.length) break;
+        const before = dayStats.n;
         dayBlock = buildDayBlock({
           spans: ds.spans,
           stripped: ds.stripped,
@@ -1532,6 +1535,11 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now(), collect } = {
           maxChars: 300,
           stats: dayStats,
         });
+        if (dayStats.n > before || dayBlock) {
+          if (level > 1) diag(`时间词放宽到第 ${level} 轮才命中`);
+          break;
+        }
+        diag(`时间词第 ${level} 轮没命中，放宽再试`);
       }
     }
   } catch {}
