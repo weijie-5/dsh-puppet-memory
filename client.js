@@ -173,6 +173,9 @@ window.__ModuleLoader__.load({
         configFile: c.configFile !== false,
         sessions: c.sessions !== false,
         dir: typeof c.dir === 'string' ? c.dir : '',
+        workEnabled: c.workEnabled === true,
+        workDir: typeof c.workDir === 'string' ? c.workDir : '',
+        workMode: c.workMode === 'all' ? 'all' : 'manual',
       }
     }
 
@@ -816,7 +819,24 @@ window.__ModuleLoader__.load({
               h(Check, { checked: form.sessions, disabled: busy, text: '原始会话日志', onChange: (v) => patch('sessions', v) }),
             ),
             h(Row, { label: '备份目录' }, h('input', { className: 'pmb-input pmb-input-wide', type: 'text', value: form.dir, disabled: busy, spellCheck: false, onChange: (ev) => patch('dir', ev.target.value) }), h('span', { className: 'pmb-sub' }, '必须绝对路径；留空则用默认 F:\\dsh-memory-backup。')),
-            h(NOTE, null, '深层记忆与图片/音频资产始终会备份；「行为记忆」是 relations / user / memo / notes / diary / sources / persona。'),
+            h(Row, { label: '工作文件' },
+              h(Check, { checked: form.workEnabled, disabled: busy, text: form.workEnabled ? '开（一并复制进快照的 work/）' : '关（默认，不影响任何东西）', onChange: (v) => patch('workEnabled', v) }),
+            ),
+            form.workEnabled
+              ? h(Row, { label: '工作文件目录' },
+                  h('input', { className: 'pmb-input pmb-input-wide', type: 'text', value: form.workDir, disabled: busy, spellCheck: false, placeholder: '例如 F:\\工作导出（绝对路径）', onChange: (ev) => patch('workDir', ev.target.value) }),
+                  h('span', { className: 'pmb-sub' }, '整个目录原样复制；不进记忆库、不参与检索，只在快照里留一份原文。'),
+                )
+              : null,
+            form.workEnabled
+              ? h(Row, { label: '带上时机' },
+                  h('select', { className: 'pmb-input', value: form.workMode, disabled: busy, onChange: (ev) => patch('workMode', ev.target.value) },
+                    h('option', { value: 'manual' }, '只在手动备份时（立即备份一次 / memory_backup）'),
+                    h('option', { value: 'all' }, '自动备份也带（每天一份都含工作文件，占空间）'),
+                  ),
+                )
+              : null,
+            h(NOTE, null, '深层记忆与图片/音频资产始终会备份；「行为记忆」是 relations / user / memo / notes / diary / sources / persona。工作文件默认关，单次上限 2GB，超过就整体跳过（不做半份备份）。'),
           )
         : null
 

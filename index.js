@@ -709,6 +709,16 @@ function defaultConfig() {
       config: true,
       minIntervalHours: 24,
       keepDays: 30,
+      // v0.43.0（2026-11-17 丹阳）：主动备份带「工作文件」。
+      // 默认关——不用的人一行不受影响；开了以后把 work.dir 整个复制进快照的 work/。
+      // 为什么要它：网页那边导出的工作内容不属于记忆库（进去只会拖累检索），
+      // 但也不该只活在网页里（导出只带文字、会话会被清理）。放这儿等于给它一个冷库存放点。
+      work: {
+        enabled: false,
+        dir: "",
+        mode: "manual", // manual=只在「立即备份一次」时带；all=自动备份也带
+        maxBytes: 2 * 1024 ** 3,
+      },
       // 云盘加密包（v0.39.0，2026-10-30 丹阳：备份到指定文件夹，开百度网盘就自动同步）
       // 与上面的本地快照互补：本地快照防手滑，云包防整机/整盘丢失。
       // 密码**不落盘**：只从调用参数或环境变量 DSH_MEMORY_BACKUP_PASS 读。
@@ -813,6 +823,7 @@ function loadConfig() {
   merged.self.audit = { ...defaultConfig().self.audit, ...((cfg.self && cfg.self.audit) || {}) };
   merged.backup = { ...defaultConfig().backup, ...(cfg.backup || {}) };
   merged.backup.cloud = { ...defaultConfig().backup.cloud, ...((cfg.backup && cfg.backup.cloud) || {}) };
+  merged.backup.work = { ...defaultConfig().backup.work, ...((cfg.backup && cfg.backup.work) || {}) };
   merged.sessions = { ...defaultConfig().sessions, ...(cfg.sessions || {}) };
   merged.autoSummary = { ...defaultConfig().autoSummary, ...(cfg.autoSummary || {}) };
   merged.facts = { ...defaultConfig().facts, ...(cfg.facts || {}) };
@@ -2222,6 +2233,65 @@ function resolveBackupDir(backup = {}) {
   return { dir: "", note: `备份目录不可写：${wanted}；回退目录 ${fallback} 也不可写` };
 }
 
+// v0.43.0：工作文件备份的三个小工具。
+function humanBytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1024 ** 3) return `${(v / 1024 ** 3).toFixed(1)}GB`;
+  if (v >= 1024 ** 2) return `${(v / 1024 ** 2).toFixed(1)}MB`;
+  if (v >= 1024) return `${(v / 1024).toFixed(0)}KB`;
+  return `${v}B`;
+}
+
+// 走一遍目录只算体积与文件数；超过 cap 立刻停（误指 C:\ 时不会把整盘遍历一遍）。
+function measureDir(dir, cap) {
+  let bytes = 0;
+  let files = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(cur, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      const full = path.join(cur, ent.name);
+      if (ent.isSymbolicLink()) continue; // 符号链接不跟：防环、防跳出目录
+      if (ent.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!ent.isFile()) continue;
+      try {
+        bytes += fs.statSync(full).size;
+      } catch {
+        continue;
+      }
+      files += 1;
+      if (cap > 0 && bytes > cap) return { bytes, files, hitCap: true };
+    }
+  }
+  return { bytes, files, hitCap: false };
+}
+
+// 把工作目录复制进快照。超过上限就整体跳过——半份备份比没有更误导人。
+function copyWorkDir(srcDir, destDir, maxBytes) {
+  const cap = Number(maxBytes) > 0 ? Number(maxBytes) : 2 * 1024 ** 3;
+  const src = path.resolve(String(srcDir || ""));
+  if (!src || !fs.existsSync(src)) return { ok: false, reason: `目录不存在：${src}`, files: 0, bytes: 0 };
+  if (path.resolve(destDir).startsWith(src + path.sep)) {
+    return { ok: false, reason: "目标在源目录里面，跳过（会自己复制自己）", files: 0, bytes: 0 };
+  }
+  const size = measureDir(src, cap);
+  if (size.hitCap) {
+    return { ok: false, reason: `超过上限 ${humanBytes(cap)}，本次不带工作文件`, files: size.files, bytes: size.bytes };
+  }
+  if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+  fs.cpSync(src, destDir, { recursive: true });
+  return { ok: true, reason: "", files: size.files, bytes: size.bytes };
+}
+
 function backupNow(reason, options = {}) {
   const cfg = loadConfig();
   const backup = cfg.backup || {};
@@ -2269,6 +2339,27 @@ function backupNow(reason, options = {}) {
     if (backup.sessions !== false && fs.existsSync(SESSION_DIR)) {
       fs.cpSync(SESSION_DIR, path.join(dest, "sessions"), { recursive: true });
     }
+    // v0.43.0：工作文件（默认关；manual=只在手动备份时带，all=自动也带）
+    let workTail = "";
+    const workCfg = backup.work || {};
+    if (workCfg.enabled) {
+      const workSrc = String(workCfg.dir || "").trim();
+      // 「手动」看调用方语义：memory_backup 走 reason=manual；面板「立即备份一次」也是 manual。
+      // force 只用来跳过间隔节流，不算手动——否则自动触发一 force 就顺手把工作文件带上了。
+      const isManual = String(reason || "") === "manual" || options.work === true;
+      const workMode = workCfg.mode === "all" ? "all" : "manual";
+      if (!workSrc) {
+        workTail = "；工作文件：开了但没设目录，跳过";
+      } else if (workMode !== "all" && !isManual) {
+        workTail = "；工作文件：只随手动备份带走";
+      } else {
+        const w = copyWorkDir(workSrc, path.join(dest, "work"), workCfg.maxBytes);
+        workTail = w.ok
+          ? `；工作文件 ${w.files} 个 / ${humanBytes(w.bytes)}`
+          : `；工作文件跳过：${w.reason}`;
+        if (!w.ok) log("warn", `工作文件未备份：${w.reason}`);
+      }
+    }
 
     // 落盘自检：目录必须真的写出来了，否则不更新状态（避免「说备份了其实没有」）
     const written = fs.existsSync(dest) ? fs.readdirSync(dest).length : 0;
@@ -2290,8 +2381,8 @@ function backupNow(reason, options = {}) {
     const keepDays = Number(backup.keepDays) || 30;
     const removed = pruneOldSnapshots(dir, keepDays);
     const tail = removed ? `，清理 ${removed} 个过期快照（保留 ${keepDays} 天）` : "";
-    log("info", `备份完成（${reason || "manual"}）→ ${dest}${tail}`);
-    return `备份完成：${dest}${tail}${resolved.note ? `（${resolved.note}）` : ""}`;
+    log("info", `备份完成（${reason || "manual"}）→ ${dest}${tail}${workTail}`);
+    return `备份完成：${dest}${tail}${workTail}${resolved.note ? `（${resolved.note}）` : ""}`;
   } catch (err) {
     log("warn", `备份失败：${err?.message || err}`);
     return `备份失败：${err?.message || err}`;
@@ -2446,6 +2537,10 @@ function backupPolicySummary() {
       behavior: backup.behavior !== false,
       configFile: backup.config !== false,
       sessions: backup.sessions !== false,
+      workEnabled: (backup.work && backup.work.enabled) === true,
+      workDir: String((backup.work && backup.work.dir) || ""),
+      workMode: (backup.work && backup.work.mode) === "all" ? "all" : "manual",
+      workMaxBytes: Number((backup.work && backup.work.maxBytes) || 0) || 2 * 1024 ** 3,
     },
     runtime: {
       lastBackupAt: state.lastBackupAt || "",
@@ -2677,6 +2772,25 @@ function updateBackupPolicy(patch) {
   for (const [from, to] of [["enabled", "enabled"], ["behavior", "behavior"], ["configFile", "config"], ["sessions", "sessions"]]) {
     if (body[from] !== undefined) backup[to] = Boolean(body[from]);
   }
+  const work = { ...defaultConfig().backup.work, ...(backup.work || {}) };
+  if (body.workEnabled !== undefined) work.enabled = Boolean(body.workEnabled);
+  if (body.workDir !== undefined) {
+    const wdir = String(body.workDir || "").trim();
+    if (wdir && !path.isAbsolute(wdir)) return { ok: false, error: "工作文件目录必须是绝对路径" };
+    work.dir = wdir;
+  }
+  if (body.workMode !== undefined) {
+    const wmode = String(body.workMode || "manual");
+    if (wmode !== "manual" && wmode !== "all") return { ok: false, error: "工作文件备份时机只能是 manual 或 all" };
+    work.mode = wmode;
+  }
+  if (body.workMaxBytes !== undefined) {
+    const mb = Number(body.workMaxBytes);
+    if (!Number.isFinite(mb) || mb < 1 || mb > 200) return { ok: false, error: "工作文件上限必须是 1–200（GB）" };
+    work.maxBytes = Math.round(mb * 1024 ** 3);
+  }
+  if (work.enabled && !work.dir) return { ok: false, error: "开了工作文件备份，就得给一个目录" };
+  backup.work = work;
   cfg.backup = backup;
   saveConfig(cfg);
   log("info", `备份策略已更新：${JSON.stringify(backup)}`);
@@ -9584,7 +9698,7 @@ ${selfText}
 
       name: "memory_backup",
       description:
-        "立刻把记忆备份到 F 盘（深层、阵列、行为记忆、图片/音频资产、配置与运行态、原始会话）。自动备份一天最多一次、只保留 30 天；手动调用不受频率限制，也不会被清理策略拦。自动备份的频率/保留天数/是否含行为记忆，可在 Web UI「设置 → 记忆备份」面板里点选，等价于改 config.json 的 backup 段。mode=cloud 时改为生成**加密云包**（AES-256-GCM）写进指定文件夹（默认百度网盘同步目录 F:\\BaiduSyncdisk\\dsh-memory-cloud），网盘客户端一开就自动上传；云备份的密码不落盘，只读参数 password 或环境变量 DSH_MEMORY_BACKUP_PASS。【使用规则】密码绝不写进配置、脚本、文档或记忆；恢复时先解到独立目录、核对 sha256，确认后再人工覆盖记忆库（不要直接解到原位）。",
+        "立刻把记忆备份到 F 盘（深层、阵列、行为记忆、图片/音频资产、配置与运行态、原始会话）。若开着 config.backup.work（默认关，设置面板「工作文件」），会把那个目录一并复制进快照的 work/——那是给网页导出的工作内容准备的冷库位，不进记忆库、不参与检索；传 work:true 表示这一次强制带上。自动备份一天最多一次、只保留 30 天；手动调用不受频率限制，也不会被清理策略拦。自动备份的频率/保留天数/是否含行为记忆，可在 Web UI「设置 → 记忆备份」面板里点选，等价于改 config.json 的 backup 段。mode=cloud 时改为生成**加密云包**（AES-256-GCM）写进指定文件夹（默认百度网盘同步目录 F:\\BaiduSyncdisk\\dsh-memory-cloud），网盘客户端一开就自动上传；云备份的密码不落盘，只读参数 password 或环境变量 DSH_MEMORY_BACKUP_PASS。【使用规则】密码绝不写进配置、脚本、文档或记忆；恢复时先解到独立目录、核对 sha256，确认后再人工覆盖记忆库（不要直接解到原位）。",
       parameters: {
         type: "object",
         properties: {
@@ -9594,6 +9708,7 @@ ${selfText}
           sessions: { type: "boolean", description: "cloud 用：是否含会话原文（默认不含，含了包大很多且涉隐私）" },
           assets: { type: "boolean", description: "cloud 用：是否含图片/音频资产（默认含）" },
           keepPacks: { type: "number", description: "cloud 用：目录里保留几个包（默认 6，旧的自动删）" },
+          work: { type: "boolean", description: "local 用：这一次把工作文件也带上（config.backup.work 开着才有目录可取；不用改配置）" },
         },
       },
       output,
@@ -9601,7 +9716,7 @@ ${selfText}
         try {
           ensureDirs();
           if (String(args?.mode || "local") === "cloud") return cloudBackupNow(args || {});
-          return backupNow("manual", { force: true });
+          return backupNow("manual", { force: true, work: args?.work === true });
         } catch (err) {
           return `备份失败：${err?.message || err}`;
         }
@@ -9935,6 +10050,6 @@ const plugin = {
   apply,
 };
 
-export { apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, addOpeningRow, removeOpeningRow, readOpeningRows, pruneOpeningRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, featuresView, setFeature, memoryOverview, openingUpdate, openingDelete, nowView, updateNowMode, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
+export { copyWorkDir, measureDir, humanBytes, apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, addOpeningRow, removeOpeningRow, readOpeningRows, pruneOpeningRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, featuresView, setFeature, memoryOverview, openingUpdate, openingDelete, nowView, updateNowMode, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
 export default plugin;
 
