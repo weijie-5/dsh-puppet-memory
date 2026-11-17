@@ -216,7 +216,6 @@ window.__ModuleLoader__.load({
       const [editing, setEditing] = useState(null)
       const [editDraft, setEditDraft] = useState({ label: '', date: '', lunar: '', note: '' })
       const [showAllOpening, setShowAllOpening] = useState(false)
-      const [nowCfg, setNowCfg] = useState(null)
 
       const load = useCallback(async () => {
         setError('')
@@ -224,7 +223,6 @@ window.__ModuleLoader__.load({
           const res = await callApi('overview')
           if (!res || res.ok !== true) throw new Error((res && res.error) || '读取失败')
           setData(res)
-          setNowCfg(res.now || { mode: 'gap', gapMinutes: 10 })
         } catch (err) {
           setError(err && err.message ? err.message : String(err))
         }
@@ -250,14 +248,6 @@ window.__ModuleLoader__.load({
         const res = await callApi('opening-delete', { index: i })
         if (res && res.ok === true) setData(res); else setError((res && res.error) || '删除失败')
       }
-      const saveNow = async (patch) => {
-        const next = { ...(nowCfg || {}), ...patch }
-        setNowCfg(next)
-        const res = await callApi('now', next)
-        if (res && res.ok === true) {
-          setNowCfg({ mode: res.mode, gapMinutes: res.gapMinutes })
-        } else setError((res && res.error) || '保存失败')
-      }
       const cards = data.cards || []
       const counts = data.counts || {}
       const backup = data.backup || {}
@@ -281,30 +271,6 @@ window.__ModuleLoader__.load({
             h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '便签'), h('div', { className: 'pmb-v' }, String(counts.memo || 0))),
             h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '笔记'), h('div', { className: 'pmb-v' }, String(counts.notes || 0))),
             h('div', { className: 'pmb-kv' }, h('div', { className: 'pmb-k' }, '常言'), h('div', { className: 'pmb-v' }, String(counts.sayings || 0))),
-          ),
-        ),
-        h('div', { className: 'pmb-card' },
-          h('div', { className: 'pmb-title' }, '时间提示'),
-          h('div', { className: 'pmb-hint' }, '插件自己的钩子，零模型成本。选一种：隔久才给 / 跟着回忆走 / 两者任一 / 不给。'),
-          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
-            h('select', {
-              className: 'pmb-in',
-              value: (nowCfg || {}).mode || 'gap',
-              onChange: (e) => saveNow({ mode: e.target.value }),
-            },
-              h('option', { value: 'gap' }, '隔久了才给（默认）'),
-              h('option', { value: 'recall' }, '只有翻出旧回忆时才给'),
-              h('option', { value: 'both' }, '两者任一'),
-              h('option', { value: 'off' }, '不给时间'),
-            ),
-            h('span', { className: 'pmb-sub' }, '间隔'),
-            h('input', {
-              className: 'pmb-in', type: 'number', min: 1, max: 1440,
-              style: { width: 72 },
-              value: (nowCfg || {}).gapMinutes || 10,
-              onChange: (e) => saveNow({ gapMinutes: Number(e.target.value) || 10 }),
-            }),
-            h('span', { className: 'pmb-sub' }, '分钟（只在「隔久」「两者任一」下有效）'),
           ),
         ),
         h('div', { className: 'pmb-card' },
@@ -389,6 +355,58 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // 时间提示的开关（v1.3）：插件自己的钩子，零模型；放在「功能开关」页底部
+    function NowHintCard() {
+      const { useState, useEffect, useCallback } = React
+      const [cfg, setCfg] = useState(null)
+      const [error, setError] = useState('')
+
+      const load = useCallback(async () => {
+        try {
+          const res = await callApi('now')
+          if (res && res.ok === true) setCfg({ mode: res.mode, gapMinutes: res.gapMinutes })
+          else setError((res && res.error) || '读取失败')
+        } catch (err) {
+          setError(err && err.message ? err.message : String(err))
+        }
+      }, [])
+      useEffect(() => { load() }, [load])
+
+      const save = async (patch) => {
+        const next = { ...(cfg || {}), ...patch }
+        setCfg(next)
+        const res = await callApi('now', next)
+        if (res && res.ok === true) setCfg({ mode: res.mode, gapMinutes: res.gapMinutes })
+        else setError((res && res.error) || '保存失败')
+      }
+
+      return h('div', { className: 'pmb-card' },
+        h('div', { className: 'pmb-title' }, '时间提示'),
+        h('div', { className: 'pmb-hint' }, '插件自己的钩子，零模型成本。选一种：隔久才给 / 跟着回忆走 / 两者任一（任一条件满足就给）/ 不给。'),
+        error ? h('div', { className: 'pmb-error' }, error) : null,
+        h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+          h('select', {
+            className: 'pmb-in',
+            value: (cfg || {}).mode || 'gap',
+            onChange: (e) => save({ mode: e.target.value }),
+          },
+            h('option', { value: 'gap' }, '隔久了才给（默认）'),
+            h('option', { value: 'recall' }, '只有翻出旧回忆时才给'),
+            h('option', { value: 'both' }, '两者任一'),
+            h('option', { value: 'off' }, '不给时间'),
+          ),
+          h('span', { className: 'pmb-sub' }, '间隔'),
+          h('input', {
+            className: 'pmb-in', type: 'number', min: 1, max: 1440,
+            style: { width: 72 },
+            value: (cfg || {}).gapMinutes || 10,
+            onChange: (e) => save({ gapMinutes: Number(e.target.value) || 10 }),
+          }),
+          h('span', { className: 'pmb-sub' }, '分钟'),
+        ),
+      )
+    }
+
     function FeaturesPanel() {
       const { useState, useEffect, useCallback } = React
       const [items, setItems] = useState(null)
@@ -450,6 +468,7 @@ window.__ModuleLoader__.load({
                 }, item.enabled ? '已开启' : '已关闭'),
               )),
             ),
+        h(NowHintCard),
       )
     }
 
