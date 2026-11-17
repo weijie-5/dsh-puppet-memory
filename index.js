@@ -1981,7 +1981,11 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
     parts.push(`【关系】${body}`);
   }
 
-  const notes = tailJsonl(PATHS.notes, 6).filter((n) => !suppressed.has(String(n?.hash || "")) && !n?.voided);
+  // v1.8（2026-11-17）：【工作日志】是自动转存的上下文残片，不是可用笔记——注入时跳过（数据留着）
+  const isWorkLog = (n) => /^【工作日志/.test(String(n?.text || ""));
+  const notes = tailJsonl(PATHS.notes, 24)
+    .filter((n) => !suppressed.has(String(n?.hash || "")) && !n?.voided && !isWorkLog(n))
+    .slice(-6);
   if (notes.length && want("notes")) {
     const noteBody = compact
       ? notes.slice(0, 2).map((n) => clip(n.text, 40)).join("；")
