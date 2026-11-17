@@ -7880,7 +7880,17 @@ function apply(ctx) {
           // v0.39（B-94）：取词器 + 提词器。默认关；开着时每回合可能多一次小模型调用。
           // 丹阳 2026-10-29 定的分工：取词器**每回合取新词**（不被待判堵住）；
           // 提词器只看「上一段 + 这一段」（更早的作废），用来判这条算不算回忆、以及你上句是确认还是否认。
-          if (cfgLive.cueprompt?.enabled) {
+          // v1.9（2026-11-17 丹阳）：刚调过工具就是**干活**，不是闲聊——这时候不取词（工作不用回忆）
+          const toolBusy = (() => {
+            try {
+              const msgs = (decision.messages || []).slice(-4);
+              return msgs.some((m) => Array.isArray(m && m.content) && m.content.some((p) => p && typeof p.type === "string" && p.type.startsWith("tool")));
+            } catch {
+              return false;
+            }
+          })();
+          if (toolBusy) diag("取词器跳过：这一轮在调工具（干活不回忆）");
+          if (cfgLive.cueprompt?.enabled && !toolBusy) {
             const NL = String.fromCharCode(10);
             // 剥掉注入块后可能只剩空串（宿主把 <puppet_*> 也记成 user/message，还不一定带 source），
             // 所以多取几条、只留剥完仍有内容的：第 0 条是这一段，第 1 条是上一段。
