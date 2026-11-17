@@ -716,8 +716,10 @@ function defaultConfig() {
       work: {
         enabled: false,
         dir: "",
-        mode: "manual", // manual=只在「立即备份一次」时带；all=自动备份也带
-        maxBytes: 2 * 1024 ** 3,
+        // 只随「手动备份」走，绝不进每日快照轮转——工作文件是 GB 级的，
+        // 跟 30 天保留一起滚会把 F 盘吃光；所以单独存 work-<时间>/，自己留 keepArchives 份。
+        keepArchives: 10,
+        maxBytes: 20 * 1024 ** 3,
       },
       // 云盘加密包（v0.39.0，2026-10-30 丹阳：备份到指定文件夹，开百度网盘就自动同步）
       // 与上面的本地快照互补：本地快照防手滑，云包防整机/整盘丢失。
@@ -2292,6 +2294,33 @@ function copyWorkDir(srcDir, destDir, maxBytes) {
   return { ok: true, reason: "", files: size.files, bytes: size.bytes };
 }
 
+// v0.43.0：工作文件备份单独成 work-<stamp> 目录，自己按份数轮转——
+// 不跟记忆快照的保留天数走（GB 级的东西按 30 天滚会把盘吃光）。
+function pruneOldWorkArchives(dir, keep, justWritten = "") {
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.startsWith("work-"));
+  } catch {
+    return 0;
+  }
+  names.sort();
+  const keepN = Math.max(1, Math.round(Number(keep) || 10));
+  const drop = names.length > keepN ? names.slice(0, names.length - keepN) : [];
+  let removed = 0;
+  for (const n of drop) {
+    const full = path.join(dir, n);
+    if (justWritten && path.resolve(full) === path.resolve(justWritten)) continue;
+    try {
+      fs.rmSync(full, { recursive: true, force: true });
+      removed += 1;
+    } catch (err) {
+      diag(`清理旧工作备份失败 ${n}：${err?.message || err}`);
+    }
+  }
+  if (removed) log("info", `清理旧工作备份 ${removed} 份（保留 ${keepN} 份）`);
+  return removed;
+}
+
 function backupNow(reason, options = {}) {
   const cfg = loadConfig();
   const backup = cfg.backup || {};
@@ -2345,19 +2374,28 @@ function backupNow(reason, options = {}) {
     if (workCfg.enabled) {
       const workSrc = String(workCfg.dir || "").trim();
       // 「手动」看调用方语义：memory_backup 走 reason=manual；面板「立即备份一次」也是 manual。
-      // force 只用来跳过间隔节流，不算手动——否则自动触发一 force 就顺手把工作文件带上了。
+      // 自动触发永不带走工作文件：那是 GB 级的东西，不能跟着 30 天轮转一起滚。
       const isManual = String(reason || "") === "manual" || options.work === true;
-      const workMode = workCfg.mode === "all" ? "all" : "manual";
       if (!workSrc) {
         workTail = "；工作文件：开了但没设目录，跳过";
-      } else if (workMode !== "all" && !isManual) {
+      } else if (!isManual) {
         workTail = "；工作文件：只随手动备份带走";
       } else {
-        const w = copyWorkDir(workSrc, path.join(dest, "work"), workCfg.maxBytes);
-        workTail = w.ok
-          ? `；工作文件 ${w.files} 个 / ${humanBytes(w.bytes)}`
-          : `；工作文件跳过：${w.reason}`;
-        if (!w.ok) log("warn", `工作文件未备份：${w.reason}`);
+        // 同一秒内连点两次「立即备份」时不能被覆盖（快照那边有同样的处理）
+        let workDest = path.join(dir, `work-${stamp}`);
+        let wseq = 1;
+        while (fs.existsSync(workDest)) {
+          workDest = path.join(dir, `work-${stamp}-${wseq}`);
+          wseq += 1;
+        }
+        const w = copyWorkDir(workSrc, workDest, workCfg.maxBytes);
+        if (w.ok) {
+          const dropped = pruneOldWorkArchives(dir, Number(workCfg.keepArchives) || 10, workDest);
+          workTail = `；工作文件 ${w.files} 个 / ${humanBytes(w.bytes)} → ${workDest}` + (dropped ? `（清掉 ${dropped} 份旧工作备份）` : "");
+        } else {
+          workTail = `；工作文件跳过：${w.reason}`;
+          log("warn", `工作文件未备份：${w.reason}`);
+        }
       }
     }
 
@@ -2539,8 +2577,8 @@ function backupPolicySummary() {
       sessions: backup.sessions !== false,
       workEnabled: (backup.work && backup.work.enabled) === true,
       workDir: String((backup.work && backup.work.dir) || ""),
-      workMode: (backup.work && backup.work.mode) === "all" ? "all" : "manual",
-      workMaxBytes: Number((backup.work && backup.work.maxBytes) || 0) || 2 * 1024 ** 3,
+      workKeepArchives: Number((backup.work && backup.work.keepArchives) || 0) || 10,
+      workMaxBytes: Number((backup.work && backup.work.maxBytes) || 0) || 20 * 1024 ** 3,
     },
     runtime: {
       lastBackupAt: state.lastBackupAt || "",
@@ -2779,15 +2817,15 @@ function updateBackupPolicy(patch) {
     if (wdir && !path.isAbsolute(wdir)) return { ok: false, error: "工作文件目录必须是绝对路径" };
     work.dir = wdir;
   }
-  if (body.workMode !== undefined) {
-    const wmode = String(body.workMode || "manual");
-    if (wmode !== "manual" && wmode !== "all") return { ok: false, error: "工作文件备份时机只能是 manual 或 all" };
-    work.mode = wmode;
-  }
   if (body.workMaxBytes !== undefined) {
     const mb = Number(body.workMaxBytes);
-    if (!Number.isFinite(mb) || mb < 1 || mb > 200) return { ok: false, error: "工作文件上限必须是 1–200（GB）" };
+    if (!Number.isFinite(mb) || mb < 1 || mb > 500) return { ok: false, error: "工作文件上限必须是 1–500（GB）" };
     work.maxBytes = Math.round(mb * 1024 ** 3);
+  }
+  if (body.workKeepArchives !== undefined) {
+    const n = Number(body.workKeepArchives);
+    if (!Number.isFinite(n) || n < 1 || n > 100) return { ok: false, error: "工作文件保留份数必须是 1–100" };
+    work.keepArchives = Math.round(n);
   }
   if (work.enabled && !work.dir) return { ok: false, error: "开了工作文件备份，就得给一个目录" };
   backup.work = work;
@@ -9698,7 +9736,7 @@ ${selfText}
 
       name: "memory_backup",
       description:
-        "立刻把记忆备份到 F 盘（深层、阵列、行为记忆、图片/音频资产、配置与运行态、原始会话）。若开着 config.backup.work（默认关，设置面板「工作文件」），会把那个目录一并复制进快照的 work/——那是给网页导出的工作内容准备的冷库位，不进记忆库、不参与检索；传 work:true 表示这一次强制带上。自动备份一天最多一次、只保留 30 天；手动调用不受频率限制，也不会被清理策略拦。自动备份的频率/保留天数/是否含行为记忆，可在 Web UI「设置 → 记忆备份」面板里点选，等价于改 config.json 的 backup 段。mode=cloud 时改为生成**加密云包**（AES-256-GCM）写进指定文件夹（默认百度网盘同步目录 F:\\BaiduSyncdisk\\dsh-memory-cloud），网盘客户端一开就自动上传；云备份的密码不落盘，只读参数 password 或环境变量 DSH_MEMORY_BACKUP_PASS。【使用规则】密码绝不写进配置、脚本、文档或记忆；恢复时先解到独立目录、核对 sha256，确认后再人工覆盖记忆库（不要直接解到原位）。",
+        "立刻把记忆备份到 F 盘（深层、阵列、行为记忆、图片/音频资产、配置与运行态、原始会话）。若开着 config.backup.work（默认关，设置面板「工作文件」），会把手动备份那个目录整个复制成备份目录下的 work-<时间>/——那是给网页导出的工作内容准备的冷库位，不进记忆库、不参与检索、**不进每日快照轮转**（自己保留 keepArchives 份，默认 10；上限默认 20GB，GB 级也放得下）；传 work:true 表示这一次强制带上。自动备份永远不带它。自动备份一天最多一次、只保留 30 天；手动调用不受频率限制，也不会被清理策略拦。自动备份的频率/保留天数/是否含行为记忆，可在 Web UI「设置 → 记忆备份」面板里点选，等价于改 config.json 的 backup 段。mode=cloud 时改为生成**加密云包**（AES-256-GCM）写进指定文件夹（默认百度网盘同步目录 F:\\BaiduSyncdisk\\dsh-memory-cloud），网盘客户端一开就自动上传；云备份的密码不落盘，只读参数 password 或环境变量 DSH_MEMORY_BACKUP_PASS。【使用规则】密码绝不写进配置、脚本、文档或记忆；恢复时先解到独立目录、核对 sha256，确认后再人工覆盖记忆库（不要直接解到原位）。",
       parameters: {
         type: "object",
         properties: {

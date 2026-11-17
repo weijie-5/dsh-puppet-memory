@@ -1,4 +1,4 @@
-// v0.43.0：主动备份带「工作文件」——默认关、只随手动走、超上限整体跳过。
+// v0.43.0：工作文件备份——单独 work-<时间>/、只随手动走、超上限整体跳过。
 // 单元部分（copyWorkDir）不碰真实配置；集成部分临时改备份目录，跑完一定还原。
 import fs from "node:fs";
 import path from "node:path";
@@ -42,24 +42,29 @@ ok("目标在源里→跳过", r4.ok === false && /源目录里面/.test(r4.reas
 ok("measureDir 计数", measureDir(src, 10 * 1024 ** 2).files === 2);
 ok("humanBytes 有单位", /MB|KB|B/.test(humanBytes(1234567)));
 
-// ---------- 集成：真跑一次备份 ----------
+// ---------- 集成：真跑备份 ----------
 const original = fs.existsSync(CONFIG) ? fs.readFileSync(CONFIG, "utf8") : null;
 const bakDir = path.join(tmp, "backups");
 fs.mkdirSync(bakDir, { recursive: true });
+const workDirs = () => fs.readdirSync(bakDir).filter((n) => n.startsWith("work-")).sort();
 try {
-  updateBackupPolicy({ dir: bakDir, keepDays: 1, behavior: false, configFile: false, sessions: false, workEnabled: true, workDir: src, workMode: "manual" });
+  updateBackupPolicy({ dir: bakDir, keepDays: 1, behavior: false, configFile: false, sessions: false, workEnabled: true, workDir: src, workKeepArchives: 2 });
 
   const msg1 = backupNow("manual", { force: true });
   const snaps = fs.readdirSync(bakDir).filter((n) => n.startsWith("snapshot-")).sort();
   ok("备份成功", /^备份完成/.test(String(msg1)), String(msg1).slice(0, 120));
-  ok("快照里有 work/", snaps.length > 0 && fs.existsSync(path.join(bakDir, snaps[snaps.length - 1], "work", "a.txt")));
-  ok("回执提到工作文件", /工作文件 2 个/.test(String(msg1)), String(msg1).slice(0, 160));
+  ok("工作文件单独成 work- 目录", workDirs().length === 1, JSON.stringify(workDirs()));
+  ok("work 目录里有原文", workDirs().length > 0 && fs.existsSync(path.join(bakDir, workDirs()[0], "a.txt")));
+  ok("记忆快照里没有 work/", snaps.length > 0 && !fs.existsSync(path.join(bakDir, snaps[snaps.length - 1], "work")));
+  ok("回执提到工作文件", /工作文件 2 个/.test(String(msg1)), String(msg1).slice(0, 200));
 
   const msg2 = backupNow("compaction", { force: true });
-  const snaps2 = fs.readdirSync(bakDir).filter((n) => n.startsWith("snapshot-")).sort();
-  const latest = snaps2[snaps2.length - 1];
-  ok("自动触发不带工作文件", !fs.existsSync(path.join(bakDir, latest, "work")), latest);
+  ok("自动触发不带工作文件", workDirs().length === 1, JSON.stringify(workDirs()));
   ok("回执说明只随手动走", /只随手动备份带走/.test(String(msg2)), String(msg2).slice(0, 160));
+
+  backupNow("manual", { force: true });
+  backupNow("manual", { force: true });
+  ok("按份数轮转（keepArchives=2）", workDirs().length === 2, JSON.stringify(workDirs()));
 } finally {
   if (original !== null) fs.writeFileSync(CONFIG, original);
   fs.rmSync(tmp, { recursive: true, force: true });

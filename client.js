@@ -175,7 +175,8 @@ window.__ModuleLoader__.load({
         dir: typeof c.dir === 'string' ? c.dir : '',
         workEnabled: c.workEnabled === true,
         workDir: typeof c.workDir === 'string' ? c.workDir : '',
-        workMode: c.workMode === 'all' ? 'all' : 'manual',
+        workKeepArchives: Number(c.workKeepArchives) || 10,
+        workMaxGB: Math.round((Number(c.workMaxBytes) || 20 * 1024 ** 3) / 1024 ** 3),
       }
     }
 
@@ -825,18 +826,18 @@ window.__ModuleLoader__.load({
             form.workEnabled
               ? h(Row, { label: '工作文件目录' },
                   h('input', { className: 'pmb-input pmb-input-wide', type: 'text', value: form.workDir, disabled: busy, spellCheck: false, placeholder: '例如 F:\\工作导出（绝对路径）', onChange: (ev) => patch('workDir', ev.target.value) }),
-                  h('span', { className: 'pmb-sub' }, '整个目录原样复制；不进记忆库、不参与检索，只在快照里留一份原文。'),
+                  h('span', { className: 'pmb-sub' }, '整个目录原样复制；不进记忆库、不参与检索，只在快照旁留一份原文。'),
                 )
               : null,
             form.workEnabled
-              ? h(Row, { label: '带上时机' },
-                  h('select', { className: 'pmb-input', value: form.workMode, disabled: busy, onChange: (ev) => patch('workMode', ev.target.value) },
-                    h('option', { value: 'manual' }, '只在手动备份时（立即备份一次 / memory_backup）'),
-                    h('option', { value: 'all' }, '自动备份也带（每天一份都含工作文件，占空间）'),
-                  ),
+              ? h(Row, { label: '工作文件额度' },
+                  h('input', { className: 'pmb-input', type: 'number', min: 1, max: 100, step: 1, value: String(form.workKeepArchives), disabled: busy, onChange: (ev) => patch('workKeepArchives', ev.target.value) }),
+                  h('span', { className: 'pmb-sub' }, '份；单独存 work-<时间>/，自己轮转。'),
+                  h('input', { className: 'pmb-input', type: 'number', min: 1, max: 500, step: 1, value: String(form.workMaxGB), disabled: busy, onChange: (ev) => patch('workMaxGB', ev.target.value) }),
+                  h('span', { className: 'pmb-sub' }, 'GB 上限（默认 20）。'),
                 )
               : null,
-            h(NOTE, null, '深层记忆与图片/音频资产始终会备份；「行为记忆」是 relations / user / memo / notes / diary / sources / persona。工作文件默认关，单次上限 2GB，超过就整体跳过（不做半份备份）。'),
+            h(NOTE, null, '深层记忆与图片/音频资产始终会备份；「行为记忆」是 relations / user / memo / notes / diary / sources / persona。工作文件默认关，**只随手动备份走、不进每日快照轮转**（GB 级也扛得住，默认上限 20GB，超了整体跳过、不做半份备份）。'),
           )
         : null
 
