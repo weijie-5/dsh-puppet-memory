@@ -1272,6 +1272,21 @@ function archiveRelationOverflow(cfg) {
 
 // v0.22：核心记忆小文件。它是「常驻卡」不是日记——只放称呼约定、风格红线、
 // 当前主线、绝对不能忘的事。读的时候按预算截断，截了就明确标出来。
+// v1.7（2026-11-17 丹阳）：链接即触发词——看到某站的链接，就把那处的「圈子印象」整条给出来
+const LINK_TRIGGERS = [
+  { re: /xiaoheihe\.cn/i, names: ["小黑盒", "黑盒"] },
+  { re: /(bilibili\.com|b23\.tv|^BV[0-9A-Za-z]{10}$)/i, names: ["B站", "bilibili"] },
+];
+
+function linkTriggersOf(text) {
+  const t = String(text || "");
+  const out = [];
+  for (const tr of LINK_TRIGGERS) {
+    if (tr.re.test(t)) out.push(...tr.names);
+  }
+  return [...new Set(out)];
+}
+
 // v1.4（2026-11-17）：卡片的「缺失比例」——按 12 字滑窗看当前上下文里还剩多少
 function contextTextOf(messages) {
   try {
@@ -7668,6 +7683,7 @@ function apply(ctx) {
         // 哪层缺超 30% 就只补那一层；没缺就啥也不补。
         let text = "";
         const userTextNow = stripInjected(lastUserText(decision.messages || []).text);
+        const queryForLayers = [userTextNow, ...linkTriggersOf(userTextNow)].join(" ");
         try {
           const supPlan = supLayerPlan.get(sessionId) || { turn: 0, check: 0 };
           supPlan.turn += 1;
@@ -7692,7 +7708,7 @@ function apply(ctx) {
               suppressed,
               only: new Set(chosen),
               skipDiary: !chosen.includes("diary"),
-              queryText: userTextNow,
+              queryText: queryForLayers,
             });
             diag(`补充层注入：${chosen.join("+")}（turn=${supPlan.turn}${justCompressed ? "，压缩后" : ""}）`);
           }
@@ -7737,7 +7753,15 @@ function apply(ctx) {
             try {
               const cc = { ...circleDefaults, ...((cfgLive && cfgLive.circle) || {}) };
               if (cc.enabled !== false && !suppressed.has("circle")) {
-                circleText = circleLayer().render(circleLayer().pick(userText, cc), cc);
+                const linkNames = linkTriggersOf(userText);
+                let picked = circleLayer().pick(userText, cc);
+                if (linkNames.length) {
+                  // 链接优先：按名字取整条，字数放宽到 600（这是"到这站该怎么说"的完整说明）
+                  const all = circleLayer().list({ includeDisabled: false });
+                  const forced = all.filter((r) => [r.name, ...(r.aliases || [])].some((k) => linkNames.some((n) => String(k || "").toLowerCase().includes(n.toLowerCase()))));
+                  if (forced.length) picked = forced.map((r) => ({ r, matched: [r.name] }));
+                }
+                circleText = circleLayer().render(picked, linkNames.length ? { ...cc, maxCharsPer: 600 } : cc);
               }
             } catch (err) {
               diag(`圈子印象注入跳过：${err?.message || err}`);
