@@ -7651,16 +7651,17 @@ function apply(ctx) {
         plan.turn += 1;
         const justCompressed = pendingStrong.get(sessionId) === true;
         if (justCompressed) pendingStrong.delete(sessionId);
+        // offset：错开检查轮次，避免几张卡挤在同一轮一起补（丹阳 2026-11-17）
         const cardPolicy = {
-          core: { every: 5, thr: 0.2 },
-          rules: { every: 10, thr: 0.1 },
-          state: { every: 20, thr: 0.1, weakOnly: true, toolTrigger: true },
+          core: { every: 5, off: 0, thr: 0.2 },
+          rules: { every: 10, off: 5, thr: 0.1 },
+          state: { every: 20, off: 10, thr: 0.1, weakOnly: true, toolTrigger: true },
         };
         const decide = (id, raw) => {
           const p = cardPolicy[id];
           if (!raw) return "skip";
           if (justCompressed) return id === "state" ? "weak" : "strong";
-          const due = plan.turn - (plan[id] || 0) >= p.every || (p.toolTrigger && hasToolCall);
+          const due = (plan.turn % p.every === (p.off || 0)) || (p.toolTrigger && hasToolCall);
           if (!due) return "weak";
           plan[id] = plan.turn;
           const miss = missingRatioOf(raw, ctxNow);
@@ -8079,7 +8080,7 @@ function apply(ctx) {
             // 自我层跟核心卡同节奏：压缩后强补充一次；每 5 轮查一次，缺 >20% 才强补，否则只提醒
             const selfFull = selfLayer().injectText((sc.inject && sc.inject.maxChars) || 400);
             const planNow = cardPlan.get(sessionId) || { turn: 0, self: 0 };
-            const selfDue = planNow.turn - (planNow.self || 0) >= 5;
+            const selfDue = planNow.turn % 5 === 2;
             const selfCtx = contextTextOf(decision.messages || []);
             if (justCompressed) {
               selfText = selfFull;
