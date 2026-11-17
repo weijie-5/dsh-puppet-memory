@@ -1182,7 +1182,7 @@ function findSessionFile(sessionId, sessionDir = SESSION_DIR) {
 // ---------------------------------------------------------------------------
 
 // 关系注入行：超预算时保留最新条目完整，被裁掉的旧条目的文本返回给调用方（用于转存深层引导）
-function relationInjectionLines(cfg, ratio = 0.55, suppressed = new Set()) {
+function relationInjectionLines(cfg, ratio = 0.55, suppressed = new Set(), extraQueryText = "") {
   const maxChars = Math.max(200, Number(cfg?.inject?.maxChars) || DEFAULT_INJECT_MAX);
   const budget = Math.round(maxChars * Math.max(0.3, Math.min(0.8, Number(ratio) || 0.55)));
   // v0.28：本会话屏蔽的条目直接不进注入（数据还在，随时可解除）
@@ -1196,9 +1196,31 @@ function relationInjectionLines(cfg, ratio = 0.55, suppressed = new Set()) {
       supersededBy.set(String(oldHash), { reason: `被 #${String(row.hash || "").slice(0, 8)} 取代`, at: String(row.ts || ""), by: String(row.hash || "") });
     }
   }
-  const relations = tailJsonl(PATHS.relations, 12).filter(
+  // v1.6（2026-11-17 丹阳）：关系层按用途/话题挑——不是全量摊开，只补这轮用得上的
+  let relations = tailJsonl(PATHS.relations, 12).filter(
     (r) => !suppressed.has(String(r?.hash || "")) && !r?.voided && !endedInfoOf(r, supersededBy),
   );
+  const q = String(extraQueryText || "").trim();
+  if (q) {
+    const all = readJsonl(PATHS.relations).filter(
+      (r) => !suppressed.has(String(r?.hash || "")) && !r?.voided && !endedInfoOf(r, supersededBy),
+    );
+    const scoreOf = (r) => {
+      const kw = String(r.keyword || "");
+      const meaning = String(r.meaning || "");
+      let sc = 0;
+      if (kw && q.includes(kw)) sc += 3;
+      let hits = 0;
+      for (let i = 0; i < q.length - 1 && hits < 4; i += 1) {
+        if (meaning.includes(q.slice(i, i + 2))) hits += 1;
+      }
+      return sc + hits;
+    };
+    const scored = all.map((r) => ({ r, sc: scoreOf(r) })).filter((x) => x.sc > 0);
+    scored.sort((a, b) => b.sc - a.sc);
+    if (scored.length) relations = scored.slice(0, 8).map((x) => x.r);
+    else relations = all.slice(-3); // 没命中就退化成"最近三条"，不摊开全量
+  }
   const relLines = relations.map((r) => {
     const n = imageLabelsOf(r).length;
     const a = audioLabelsOf(r).length;
@@ -1925,7 +1947,7 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
 
   // v0.23：陪伴取向时多给关系记忆一点预算；工作/学习取向时按话题给对应的近料
   const primary = lines && lines.primary ? lines.primary : "balanced";
-  const { kept: relLines, budget } = relationInjectionLines(cfg, primary === "companion" ? 0.62 : 0.5, suppressed);
+  const { kept: relLines, budget } = relationInjectionLines(cfg, primary === "companion" ? 0.62 : 0.5, suppressed, opts.queryText || "");
   if (relLines.length && want("relations")) parts.push(`【关系】${clip(relLines.join("；"), budget)}`);
 
   const notes = tailJsonl(PATHS.notes, 6).filter((n) => !suppressed.has(String(n?.hash || "")) && !n?.voided);
@@ -7645,6 +7667,7 @@ function apply(ctx) {
         // v1.6（2026-11-17）：补充层也分节奏——压缩后全量补（不带日记）；平时每 8 轮查一次，
         // 哪层缺超 30% 就只补那一层；没缺就啥也不补。
         let text = "";
+        const userTextNow = stripInjected(lastUserText(decision.messages || []).text);
         try {
           const supPlan = supLayerPlan.get(sessionId) || { turn: 0, check: 0 };
           supPlan.turn += 1;
@@ -7669,6 +7692,7 @@ function apply(ctx) {
               suppressed,
               only: new Set(chosen),
               skipDiary: !chosen.includes("diary"),
+              queryText: userTextNow,
             });
             diag(`补充层注入：${chosen.join("+")}（turn=${supPlan.turn}${justCompressed ? "，压缩后" : ""}）`);
           }
