@@ -1182,13 +1182,14 @@ function findSessionFile(sessionId, sessionDir = SESSION_DIR) {
 // ---------------------------------------------------------------------------
 
 // 关系注入行：超预算时保留最新条目完整，被裁掉的旧条目的文本返回给调用方（用于转存深层引导）
-function relationInjectionLines(cfg, ratio = 0.55, suppressed = new Set(), extraQueryText = "") {
+function relationInjectionLines(cfg, ratio = 0.55, suppressed = new Set(), extraQueryText = "", excludeHashes = null) {
   const maxChars = Math.max(200, Number(cfg?.inject?.maxChars) || DEFAULT_INJECT_MAX);
   const budget = Math.round(maxChars * Math.max(0.3, Math.min(0.8, Number(ratio) || 0.55)));
   // v0.28：本会话屏蔽的条目直接不进注入（数据还在，随时可解除）
   // v0.35（B-55）：标废的条目不进注入；屏蔽表同理（数据都还在，可恢复）
   // v0.37（B-74）：已结束（被取代/到期）的条目也不进注入——它是真的，但已经不是现状了
   const relRows = readJsonl(PATHS.relations);
+  const notExcluded = (r) => !(excludeHashes instanceof Set && r && excludeHashes.has(String(r.hash || "")));
   const supersededBy = new Map();
   for (const row of relRows) {
     for (const oldHash of Array.isArray(row?.supersedes) ? row.supersedes : []) {
@@ -1198,12 +1199,12 @@ function relationInjectionLines(cfg, ratio = 0.55, suppressed = new Set(), extra
   }
   // v1.6（2026-11-17 丹阳）：关系层按用途/话题挑——不是全量摊开，只补这轮用得上的
   let relations = tailJsonl(PATHS.relations, 12).filter(
-    (r) => !suppressed.has(String(r?.hash || "")) && !r?.voided && !endedInfoOf(r, supersededBy),
+    (r) => !suppressed.has(String(r?.hash || "")) && !r?.voided && !endedInfoOf(r, supersededBy) && notExcluded(r),
   );
   const q = String(extraQueryText || "").trim();
   if (q) {
     const all = readJsonl(PATHS.relations).filter(
-      (r) => !suppressed.has(String(r?.hash || "")) && !r?.voided && !endedInfoOf(r, supersededBy),
+      (r) => !suppressed.has(String(r?.hash || "")) && !r?.voided && !endedInfoOf(r, supersededBy) && notExcluded(r),
     );
     const scoreOf = (r) => {
       const kw = String(r.keyword || "");
@@ -1441,7 +1442,7 @@ function buildHandoffInjection(cfg, { nowMs = Date.now() } = {}) {
  * v0.37（B-84）：事件触发取记忆——按用户这句话里的关键词，从 relations / user / notes 里取回几条要点。
  * 零模型调用；命中才注入；总长 ≤300 字；靠 briefOf 给一行要点，细节仍要 memory_search。
  */
-function buildRecallInjection(cfg, userText, { nowMs = Date.now() } = {}) {
+function buildRecallInjection(cfg, userText, { nowMs = Date.now(), collect } = {}) {
   // v0.42：先解析"当前用哪套参数"——activeProfile 指向 profiles 里的某一份，
   // 换人/换场景只需改 config.json 的 recall.activeProfile（下一轮生效，不用重启）。
   const rec = (() => {
@@ -1601,6 +1602,12 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now() } = {}) {
     ...body,
     "</puppet_recall>",
   ].join("\n");
+  try {
+    if (collect && Array.isArray(collect)) {
+      for (const h of hits) if (h.hash) collect.push(String(h.hash));
+    }
+  } catch {}
+
   return dayBlock ? recallBlock + "\n" + dayBlock : recallBlock;
 }
 
@@ -1975,7 +1982,7 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
 
   // v0.23：陪伴取向时多给关系记忆一点预算；工作/学习取向时按话题给对应的近料
   const primary = lines && lines.primary ? lines.primary : "balanced";
-  const { kept: relLines, budget } = relationInjectionLines(cfg, primary === "companion" ? 0.62 : 0.5, suppressed, opts.queryText || "");
+  const { kept: relLines, budget } = relationInjectionLines(cfg, primary === "companion" ? 0.62 : 0.5, suppressed, opts.queryText || "", opts.excludeRelationHashes || null);
   if (relLines.length && want("relations")) {
     const body = compact ? relLines.slice(0, 2).map((l) => clip(l, 36)).join("；") : clip(relLines.join("；"), budget);
     parts.push(`【关系】${body}`);
@@ -7351,6 +7358,7 @@ function apply(ctx) {
   const cardPlan = new Map(); // sessionId -> { turn, core, rules, state, self }
   const pendingStrong = new Map(); // sessionId -> true：刚压缩过，下一步做一次强补充
   const supLayerPlan = new Map(); // sessionId -> { turn, check }：补充层每 8 轮查一次
+  const recentRelInjected = new Map(); // sessionId -> Map(hash -> turn)：5 轮内别重复注入同一条关系
   const lastRulesInjected = new Map();
   const lastCoreStateInjected = new Map();
   // v0.33（B-47）：一句话复位的一次性临时约束，按会话存、注入一次即删，不落任何文件
@@ -7729,8 +7737,10 @@ function apply(ctx) {
           supLayerPlan.set(sessionId, supPlan);
           if (chosen.length) {
             // 压缩后那一轮给全量（位置在开头、注意力足）；平时只给几句
+            const excludeRel = new Set((recentRelInjected.get(sessionId) || new Map()).keys());
             text = buildInjectionText(cfg, coreText ? core.length : 0, linesView, {
               suppressed,
+              excludeRelationHashes: excludeRel,
               only: new Set(chosen),
               skipDiary: !chosen.includes("diary"),
               queryText: queryForLayers,
@@ -7762,7 +7772,15 @@ function apply(ctx) {
           if (!suppressed.has("recall")) {
             // 他发的话前面常挂着 <system-reminder>（注入块不是他说的），取词/召回前先剥掉
             const userText = stripInjected(lastUserText(decision.messages || []).text);
-            recallText = buildRecallInjection(cfgLive, userText);
+            const relHashes = [];
+            recallText = buildRecallInjection(cfgLive, userText, { collect: relHashes });
+            if (relHashes.length) {
+              const m = recentRelInjected.get(sessionId) || new Map();
+              const turnNow = (cardPlan.get(sessionId) || {}).turn || 0;
+              for (const h of relHashes) m.set(h, turnNow);
+              for (const [k, t] of m) if (turnNow - t > 5) m.delete(k);
+              recentRelInjected.set(sessionId, m);
+            }
             // 冲突核对：只查"当前说法 vs 旧记忆"的事实矛盾；命中才注入一张短卡
             if (!suppressed.has("conflict")) {
               conflictText = await buildConflictBlock(userText, sessionId, cfgLive);
