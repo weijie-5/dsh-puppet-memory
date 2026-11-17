@@ -1963,7 +1963,13 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
   // 等于把「只注入一次」变成「每轮重灌」。时间改由单独的 <puppet_now>（10 分钟节流）负责。
   const nowMs = Date.now();
 
-  const persona = readText(PATHS.persona)
+  // v1.9（2026-11-17 丹阳）：人设只进"骨架"，解释类细节留在文件里——
+  // 解释太多会把选择收窄，人设不该像规则那样死板。
+  const personaRaw = readText(PATHS.persona);
+  const markerIdx = personaRaw.indexOf("以下细节不注入");
+  const personaSkeleton = markerIdx > 0 ? personaRaw.slice(0, Math.max(0, personaRaw.lastIndexOf("<!--", markerIdx))) : personaRaw;
+  const persona = personaSkeleton
+    .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/^#.*$/gm, "")
     .split(/\r?\n/)
     .map((l) => l.replace(/^-\s*/, "").trim())
@@ -1986,7 +1992,7 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
     }
     return out || clip(t, max);
   };
-  if (persona && want("persona")) parts.push(`【人设】${compact ? fewSentences(persona, 80) : clip(persona, Math.round(maxChars * 0.3))}`);
+  if (persona && want("persona")) parts.push(`【人设】${compact ? fewSentences(persona, 80) : clip(persona, 220)}`);
 
   // v0.23：陪伴取向时多给关系记忆一点预算；工作/学习取向时按话题给对应的近料
   const primary = lines && lines.primary ? lines.primary : "balanced";
