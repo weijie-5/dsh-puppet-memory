@@ -1918,27 +1918,30 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
     .filter(Boolean)
     .join("；");
   const suppressed = opts.suppressed instanceof Set ? opts.suppressed : new Set();
-  if (persona && !suppressed.has("persona")) parts.push(`【人设】${clip(persona, Math.round(maxChars * 0.3))}`);
+  // v1.6（2026-11-17）：补充层按层注入——只补缺的那几层，别整块重灌
+  const only = opts.only instanceof Set && opts.only.size ? opts.only : null;
+  const want = (layer) => (!only || only.has(layer)) && !suppressed.has(layer);
+  if (persona && want("persona")) parts.push(`【人设】${clip(persona, Math.round(maxChars * 0.3))}`);
 
   // v0.23：陪伴取向时多给关系记忆一点预算；工作/学习取向时按话题给对应的近料
   const primary = lines && lines.primary ? lines.primary : "balanced";
   const { kept: relLines, budget } = relationInjectionLines(cfg, primary === "companion" ? 0.62 : 0.5, suppressed);
-  if (relLines.length) parts.push(`【关系】${clip(relLines.join("；"), budget)}`);
+  if (relLines.length && want("relations")) parts.push(`【关系】${clip(relLines.join("；"), budget)}`);
 
   const notes = tailJsonl(PATHS.notes, 6).filter((n) => !suppressed.has(String(n?.hash || "")) && !n?.voided);
-  if (notes.length) {
+  if (notes.length && want("notes")) {
     parts.push(`【最近笔记】${clip(notes.map((n) => n.text).join("；"), primary === "learning" ? 420 : 320)}`);
   }
 
   // v0.23：工作取向时把最近一条便签（工作交接/待办）提前给出来，别让模型抓瞎
-  if (primary === "work") {
+  if (primary === "work" && want("memo")) {
     const memoTail = tailJsonl(PATHS.memo, 1).find((m) => !suppressed.has(String(m?.hash || "")));
     if (memoTail && memoTail.text) parts.push(`【最近便签】${clip(memoTail.text, 220)}`);
   }
 
   // 日记：重要事件（important:true）优先占位，再用最近日记补齐，最多 4 条
   // v1.5（2026-11-17 丹阳）：日记本身≈压缩过的上下文，压缩后不再补它——补了是重复
-  const diaryFiles = opts.skipDiary ? [] : dirJsonl(PATHS.diaryDir);
+  const diaryFiles = opts.skipDiary || !want("diary") ? [] : dirJsonl(PATHS.diaryDir);
   const recentDiaries = (diaryFiles.length ? tailJsonl(diaryFiles[diaryFiles.length - 1], 40) : []).filter(
     (d) => !suppressed.has(String(d?.hash || "")) && !d?.voided,
   );
@@ -7287,6 +7290,7 @@ function apply(ctx) {
   // v1.4（2026-11-17）四张卡各有自己的节奏：turn 计数、上次检查的轮次
   const cardPlan = new Map(); // sessionId -> { turn, core, rules, state, self }
   const pendingStrong = new Map(); // sessionId -> true：刚压缩过，下一步做一次强补充
+  const supLayerPlan = new Map(); // sessionId -> { turn, check }：补充层每 8 轮查一次
   const lastRulesInjected = new Map();
   const lastCoreStateInjected = new Map();
   // v0.33（B-47）：一句话复位的一次性临时约束，按会话存、注入一次即删，不落任何文件
@@ -7321,6 +7325,7 @@ function apply(ctx) {
     // 压缩后位置在上下文开头、注意力最足——下一次做一次强补充，之后回到弱补充
     pendingStrong.set(sessionId, true);
     cardPlan.delete(sessionId);
+    supLayerPlan.delete(sessionId);
     backupAsync("compress");
     // 压缩后补一条自动摘要（二期）：上下文刚被压过，说明这段对话长且重要
     scheduleAutoSummary({ session: sessionRefs.get(sessionId) || null }, sessionId, "compaction", 5000);
@@ -7637,9 +7642,39 @@ function apply(ctx) {
         // 取向没变就不重复塞（但压缩后会清指纹，自动补回）
         const stateForInject = stateText && !suppressed.has("state") && lastStateInjected.get(sessionId) !== stateDigest ? stateText : "";
         // 完整摘要（人设+关系+笔记+日记）：mode=first-step 时只在第一次注入
-        const text = firstStepDone
-          ? ""
-          : buildInjectionText(cfg, coreText ? core.length : 0, linesView, { suppressed, skipDiary: justCompressed });
+        // v1.6（2026-11-17）：补充层也分节奏——压缩后全量补（不带日记）；平时每 8 轮查一次，
+        // 哪层缺超 30% 就只补那一层；没缺就啥也不补。
+        let text = "";
+        try {
+          const supPlan = supLayerPlan.get(sessionId) || { turn: 0, check: 0 };
+          supPlan.turn += 1;
+          const supLayers = ["persona", "relations", "notes", "diary"];
+          const ctxForSup = contextTextOf(decision.messages || []);
+          let chosen = [];
+          if (justCompressed) {
+            chosen = ["persona", "relations", "notes"];
+            supPlan.check = supPlan.turn;
+          } else if (supPlan.turn - (supPlan.check || 0) >= 8) {
+            supPlan.check = supPlan.turn;
+            for (const layer of supLayers) {
+              const one = buildInjectionText(cfg, 0, linesView, { suppressed, only: new Set([layer]) });
+              if (!one) continue;
+              const miss = missingRatioOf(one, ctxForSup, 16);
+              if (miss >= 0.3) chosen.push(layer);
+            }
+          }
+          supLayerPlan.set(sessionId, supPlan);
+          if (chosen.length) {
+            text = buildInjectionText(cfg, coreText ? core.length : 0, linesView, {
+              suppressed,
+              only: new Set(chosen),
+              skipDiary: !chosen.includes("diary"),
+            });
+            diag(`补充层注入：${chosen.join("+")}（turn=${supPlan.turn}${justCompressed ? "，压缩后" : ""}）`);
+          }
+        } catch (err) {
+          diag(`补充层规划失败：${err?.message || err}`);
+        }
         // v0.37（B-84 / B-88）：事件触发取记忆 + open 交接纸条。各自独立成块，内容不变不重复。
         let handoffText = "";
         let recallText = "";
