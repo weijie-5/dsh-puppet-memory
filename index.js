@@ -7679,6 +7679,8 @@ function apply(ctx) {
         plan.turn += 1;
         const justCompressed = pendingStrong.get(sessionId) === true;
         if (justCompressed) pendingStrong.delete(sessionId);
+        // v1.9.1：**新会话第一轮也要强补充**——否则只给弱提示，模型要等到第 5 轮才看得见核心卡
+        const justStarted = plan.turn === 1;
         // offset：错开检查轮次，避免几张卡挤在同一轮一起补（丹阳 2026-11-17）
         const cardPolicy = {
           core: { every: 5, off: 0, thr: 0.2 },
@@ -7688,7 +7690,7 @@ function apply(ctx) {
         const decide = (id, raw) => {
           const p = cardPolicy[id];
           if (!raw) return "skip";
-          if (justCompressed) return id === "state" ? "weak" : "strong";
+          if (justCompressed || justStarted) return id === "state" ? "weak" : "strong";
           const due = (plan.turn % p.every === (p.off || 0)) || (p.toolTrigger && hasToolCall);
           if (!due) return "weak";
           plan[id] = plan.turn;
@@ -7738,7 +7740,7 @@ function apply(ctx) {
           const supLayers = ["persona", "relations", "notes", "diary"];
           const ctxForSup = contextTextOf(decision.messages || []);
           let chosen = [];
-          if (justCompressed) {
+          if (justCompressed || supPlan.turn <= 1) {
             chosen = ["persona", "relations", "notes"];
             supPlan.check = supPlan.turn;
           } else if (supPlan.turn - (supPlan.check || 0) >= 8) {
@@ -8179,7 +8181,7 @@ function apply(ctx) {
             const planNow = cardPlan.get(sessionId) || { turn: 0, self: 0 };
             const selfDue = planNow.turn % 5 === 2;
             const selfCtx = contextTextOf(decision.messages || []);
-            if (justCompressed) {
+            if (justCompressed || planNow.turn <= 1) {
               selfText = selfFull;
             } else if (selfDue) {
               planNow.self = planNow.turn;
