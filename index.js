@@ -9134,6 +9134,7 @@ ${selfText}
           tone: { type: "string", description: "那里的人怎么说话（一句话）" },
           taboos: { type: "string", description: "别碰什么，逗号分隔" },
           impression: { type: "string", description: "我的印象（一句话，可随时改）" },
+          related: { type: "string", description: "互相串的其它圈子名，逗号分隔（如「AI娘圈,B站」）——注入时带一句它们的调性" },
           enabled: { type: "boolean", description: "update 用：false 停用" },
           includeDisabled: { type: "boolean", description: "list 用：连停用的也列" },
         },
@@ -9146,12 +9147,12 @@ ${selfText}
           const C = circleLayer();
           const action = String(args?.action || "list");
           if (action === "add") {
-            const r = C.add({ name: args?.name, aliases: args?.aliases, tone: args?.tone, taboos: args?.taboos, impression: args?.impression });
+            const r = C.add({ name: args?.name, aliases: args?.aliases, tone: args?.tone, taboos: args?.taboos, impression: args?.impression, related: args?.related });
             if (!r.ok) return `加不了：${r.error}`;
             return `已加圈子 ${r.row.id}「${r.row.name}」${r.row.aliases.length ? `（别名：${r.row.aliases.join("、")}）` : ""}。\n文件：${C.file}`;
           }
           if (action === "update") {
-            const r = C.update({ id: args?.id, name: args?.name, aliases: args?.aliases, tone: args?.tone, taboos: args?.taboos, impression: args?.impression, enabled: args?.enabled });
+            const r = C.update({ id: args?.id, name: args?.name, aliases: args?.aliases, tone: args?.tone, taboos: args?.taboos, impression: args?.impression, related: args?.related, enabled: args?.enabled });
             if (!r.ok) return `改不了：${r.error}`;
             return `已更新「${r.row.name}」：${r.row.enabled === false ? "已停用" : "生效中"}（下一次提到它就按新的来）。`;
           }

@@ -63,7 +63,7 @@ export function createCircles({ dir } = {}) {
     return out.slice(0, 12);
   }
 
-  function add({ name, aliases, tone, taboos, impression, enabled } = {}) {
+  function add({ name, aliases, tone, taboos, impression, related, enabled } = {}) {
     const n = String(name || "").trim();
     if (!n) return { ok: false, error: "name 必填（网站/社区名，如「小黑盒」）" };
     const list = rows();
@@ -76,6 +76,7 @@ export function createCircles({ dir } = {}) {
       tone: String(tone || "").trim(),
       taboos: normList(taboos),
       impression: String(impression || "").trim(),
+      related: normList(related),
       enabled: enabled !== false,
       updatedAt: new Date().toISOString(),
     };
@@ -84,7 +85,7 @@ export function createCircles({ dir } = {}) {
     return { ok: true, row };
   }
 
-  function update({ id, name, aliases, tone, taboos, impression, enabled } = {}) {
+  function update({ id, name, aliases, tone, taboos, impression, related, enabled } = {}) {
     const key = String(id || "").trim();
     const list = rows();
     const i = list.findIndex((r) => r.id === key || r.id.startsWith(key) || (name && r.name === String(name).trim()));
@@ -95,6 +96,7 @@ export function createCircles({ dir } = {}) {
     if (tone !== undefined) r.tone = String(tone).trim();
     if (taboos !== undefined) r.taboos = normList(taboos);
     if (impression !== undefined) r.impression = String(impression).trim();
+    if (related !== undefined) r.related = normList(related);
     if (enabled !== undefined) r.enabled = Boolean(enabled);
     r.updatedAt = new Date().toISOString();
     list[i] = r;
@@ -144,6 +146,13 @@ export function createCircles({ dir } = {}) {
       if (r.impression) parts.push(`我的印象：${r.impression}`);
       const body = parts.join("；").slice(0, Math.max(40, Number(cfg.maxCharsPer) || 200));
       if (body) lines.push(`- 「${r.name}」${body}`);
+      // v1.1（2026-11-17 丹阳）：圈子之间会互相串——带一句关联圈子的调性
+      for (const relName of (r.related || []).slice(0, 2)) {
+        const other = rows().find((x) => x && x.enabled !== false && (x.name === relName || (x.aliases || []).includes(relName)));
+        if (!other) continue;
+        const brief = [other.tone, other.impression].filter(Boolean).join("；").slice(0, 80);
+        if (brief) lines.push(`- （关联「${other.name}」：${brief}）`);
+      }
     }
     if (!lines.length) return "";
     return [
