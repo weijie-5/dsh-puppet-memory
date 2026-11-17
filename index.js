@@ -7898,7 +7898,11 @@ function apply(ctx) {
             }
           })();
           if (toolBusy) diag("取词器跳过：这一轮在调工具（干活不回忆）");
-          if (cfgLive.cueprompt?.enabled && !toolBusy) {
+          // v1.9（2026-11-17 丹阳）：别的提示已经命中（世界书/圈子/常言/回忆/日期）就不重复取词——
+          // 取词器只在"什么都没有"时兜底，省一次本地判断。
+          const hintAlready = Boolean(loreText || circleText || sayingText || recallText);
+          if (hintAlready) diag("取词器跳过：这一轮已有提示命中");
+          if (cfgLive.cueprompt?.enabled && !toolBusy && !hintAlready) {
             const NL = String.fromCharCode(10);
             // 剥掉注入块后可能只剩空串（宿主把 <puppet_*> 也记成 user/message，还不一定带 source），
             // 所以多取几条、只留剥完仍有内容的：第 0 条是这一段，第 1 条是上一段。
