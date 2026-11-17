@@ -7766,7 +7766,15 @@ function apply(ctx) {
             try {
               const lc = { ...loreDefaults, ...((cfgLive && cfgLive.lore) || {}) };
               if (lc.enabled !== false && !suppressed.has("lore")) {
-                loreText = loreLayer().render(loreLayer().pick(userText, lc));
+                // v1.8（2026-11-17 丹阳）：知识是死的——先查知识库、再看当前上下文有没有；
+                // 已有 ≥80% 就不补，缺得多才补（缺的正是缺口本身）。
+                const picked = loreLayer().pick(userText, lc);
+                const ctxForLore = contextTextOf(decision.messages || []);
+                const need = picked.filter((h) => missingRatioOf(h.r.content, ctxForLore, 16) > 0.2);
+                if (need.length) {
+                  loreText = loreLayer().render(need);
+                  diag(`世界书补充：${need.map((h) => h.r.name).join("、")}（原命中 ${picked.length} 条）`);
+                }
               }
             } catch (err) {
               diag(`世界书注入跳过：${err?.message || err}`);
