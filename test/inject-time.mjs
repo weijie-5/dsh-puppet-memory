@@ -69,8 +69,10 @@ try {
     return (d?.messages || []).map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || "")));
   };
   const turn1 = await runStep();
-  const nowMsg = turn1.find((t) => t.startsWith("【现在】")) || "";
-  const nowLine = nowMsg.split("\n")[0] || "";
+  // v0.44.1：一次注入合并成一条消息了，所以【现在】要从合并后的正文里找
+  const joined = turn1.join("\n");
+  const nowMsg = (joined.match(/【现在】[^\n]*/) || [""])[0];
+  const nowLine = nowMsg;
   ok("注入里有【现在】行", !!nowLine, turn1.join("|").slice(0, 120));
   const m = nowLine ? nowLine.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/) : null;
   ok("【现在】格式为 YYYY-MM-DD HH:mm", !!m, nowLine);
@@ -78,9 +80,10 @@ try {
     const asDate = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
     ok("【现在】与本机时钟同分钟", Math.abs(Date.now() - asDate.getTime()) < 60000);
   }
-  ok("【现在】是独立时间块的第一条", nowMsg.startsWith("【现在】"), nowMsg.slice(0, 60));
-  const personaIdx = turn1.findIndex((t) => t.includes("【人设】"));
-  ok("【现在】排在人设前面", personaIdx < 0 || turn1.indexOf(nowMsg) < personaIdx, turn1.map((t) => t.slice(0, 8)).join("|"));
+  ok("【现在】独立成行（合并成一条消息后不再单独成条）", nowMsg.startsWith("【现在】"), nowMsg.slice(0, 60));
+  const nowAt = joined.indexOf("【现在】");
+  const personaAt = joined.indexOf("【人设】");
+  ok("【现在】排在人设前面", personaAt < 0 || (nowAt >= 0 && nowAt < personaAt), joined.slice(0, 80));
   ok("【现在】带时区", /（.+）$/.test(nowLine), nowLine);
 
   // ---- 拿不到时间就不写 ----

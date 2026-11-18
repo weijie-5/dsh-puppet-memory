@@ -35,7 +35,7 @@ import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 import { createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths } from "./social.js";
-import { behaviorHint, createLines, lastUserText, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens } from "./state.js";
+import { behaviorHint, createLines, lastAssistantTextId, lastUserText, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens } from "./state.js";
 import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPaths } from "./sessionmem.js";
 import { createLearn, coreLock, checkAbsurd } from "./learn.js";
 import { createConflictChecker, conflictDefaults } from "./conflict.js";
@@ -2123,6 +2123,25 @@ function modelRouteOf(value) {
 function trimToBudget(text, maxChars) {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, maxChars)}…（已截断，用 memory_search 查细节）`;
+}
+
+// v0.44.1（丹阳：「上次对话是正常的」+ 截图里一条消息下 4-5 条注入）：
+// 以前一次注入会返回 4-5 条独立消息（规则/核心/状态/自我/现在…），界面上一条一条列出来，
+// 看着就像刷屏。这里合并成一条，一次注入只留一个「上下文注入」条目。
+function mergeInjectionMessages(list) {
+  const arr = (list || []).filter(Boolean);
+  if (arr.length <= 1) return arr;
+  const texts = arr
+    .map((m) => {
+      const c = m.content;
+      if (typeof c === "string") return c;
+      if (Array.isArray(c)) return c.map((x) => (x && typeof x.text === "string" ? x.text : "")).join("");
+      return "";
+    })
+    .map((t) => String(t || "").trim())
+    .filter(Boolean);
+  if (!texts.length) return [];
+  return [injectionMessage(texts.join("\n\n"))];
 }
 
 function injectionMessage(text) {
@@ -7573,6 +7592,7 @@ function apply(ctx) {
   }
 
   const lastInjected = new Map();
+  const lastUserInjected = new Map(); // v0.44.1：sessionId -> 用户消息门牌（一条用户消息只注入一次）
   // v1.2（2026-11-16）：时间不再每轮塞——同一会话 10 分钟内只注一次（他发得勤时不必知道时间）
   const lastNowInjected = new Map();
   const NOW_THROTTLE_MS = 10 * 60 * 1000;
@@ -7925,9 +7945,9 @@ function apply(ctx) {
         const modeState = decide("state", core.rawState);
         cardPlan.set(sessionId, plan);
         diag(`卡片节奏 turn=${plan.turn} core=${modeCore} rules=${modeRules} state=${modeState}${justCompressed ? "（压缩后强补充）" : ""}`);
-        const rulesForInject = !coreAllowed ? "" : modeRules === "strong"
+        const rulesForInject = filterBoundRules(!coreAllowed ? "" : modeRules === "strong"
           ? fullOf(core.rawRules, core.rulesBudget)
-          : modeRules === "weak" ? weakHintOf("规则卡", core.rawRules, "rules") : "";
+          : modeRules === "weak" ? weakHintOf("规则卡", core.rawRules, "rules") : "", activeBinder());
         const coreText = !coreAllowed ? "" : modeCore === "strong"
           ? fullOf(core.rawCore, core.budget)
           : modeCore === "weak" ? weakHintOf("核心卡", core.rawCore, "core") : "";
@@ -8312,11 +8332,35 @@ function apply(ctx) {
         }
         if (!text && !socialText && !handoffText && !recallText && !conflictText && !loreText && !circleText && !lostDetailText && !dueText && !openingText && !cueText && !nowText && !rulesForInject && !habitsForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
         const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}${openingText}\u0000${cueText}\u0000${nowText}\u0000${conflictText}\u0000${loreText}\u0000${circleText}\u0000${lostDetailText}\u0000${rulesForInject}\u0000${habitsForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
+        // v0.44.1：注入只跟着「用户说话」走——一条新用户消息只注入一次。
+        // 触发源在外部（用户消息），注入本身不会再触发注入，也就不会自激循环。
+        const userKey = lastUserText(decision.messages || []).key || "";
+        // 注入只跟「用户说话」这一个外部事件走：
+        //  - 有用户消息且和上次不同 → 注入
+        //  - 有用户消息但和上次相同 → 跳过
+        //  - 没有用户消息、且本会话已经注入过一次 → 当成 PTC 同一回合的后续步骤，跳过
+        //  - 没有用户消息、也还没注入过 → 保持旧行为（合成调用/测试场景不堵死）
+        const prevUserKey = lastUserInjected.get(sessionId);
+        if (!userKey) {
+          if (prevUserKey) {
+            diag("跳过注入：本轮没有新用户发言（PTC 后续步骤）");
+            return decision;
+          }
+        } else if (prevUserKey === userKey) {
+          diag(`跳过注入：用户消息未变（${userKey.slice(0, 8)}）`);
+          return decision;
+        }
+        // 注入门探针（v0.44.1 排查用）：把两个门钥匙和判定结果写进 diag，一次就能看清缺哪半边
+        try {
+          diag(`注入门探针 userKey=${userKey ? userKey.slice(0, 8) : "(空)"} lastUser=${lastUserInjected.get(sessionId) ? String(lastUserInjected.get(sessionId)).slice(0, 8) : "(无)"} 内容变了=${lastInjected.get(sessionId) !== digest}`);
+        } catch {}
         if (lastInjected.get(sessionId) === digest) {
           if (injectMode === "first-step") injectedOnce.add(sessionId);
+          diag("跳过注入：内容未变（指纹相同）");
           return decision;
         }
         lastInjected.set(sessionId, digest);
+        if (userKey) lastUserInjected.set(sessionId, userKey);
         if (rulesForInject) lastRulesInjected.set(sessionId, sha1(rulesForInject));
         if (coreText) lastCoreInjected.set(sessionId, sha1(coreText));
         if (coreStateForInject) lastCoreStateInjected.set(sessionId, sha1(coreStateForInject));
@@ -8428,7 +8472,7 @@ ${selfText}
           : null;
         return {
           kind: "enter",
-          messages: [...(decision.messages || []), ...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(nowMessage ? [nowMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(sayingMessage ? [sayingMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])],
+          messages: [...(decision.messages || []), ...mergeInjectionMessages([...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(nowMessage ? [nowMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(sayingMessage ? [sayingMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])])],
         };
       } catch (err) {
         log("warn", `pre-step 注入失败：${err?.message || err}`);
@@ -8609,6 +8653,12 @@ ${selfText}
       }
       return n;
     };
+    // 给「绑定规则」用的工具名通道（每次现取，热载进来的工具也能算数）
+    schemaProvider = () => {
+      const list = toolCtx.tools?.schemas?.() || [];
+      return list.map((x) => String(x?.name || "").toLowerCase()).filter(Boolean);
+    };
+
     const register = (definition) => {
       const name = definition?.name;
       if (!fullToolset && name && !HOT_TOOLS.has(name)) {
@@ -10415,3 +10465,28 @@ const plugin = {
 export { copyWorkDir, measureDir, humanBytes, apply, loadState, saveState, STATE_PATH, filterMsgsBySeq, searchEngineOf, searchIndexStatus, closeSearchIndex, buildInjectionText, buildStateInjection, buildHandoffInjection, buildRecallInjection, buildDueInjection, buildOpeningInjection, ensureOpeningLunarRows, addOpeningRow, removeOpeningRow, readOpeningRows, pruneOpeningRows, formatNowLine, ageLabelOf, modelRouteOf, sessionMemory, createSessionMemory, sessionMemoryPaths, normalizeSessionId, isSpecialKey, doctorReport, renderDoctor, resolveBackupDir, probeWritable, coreInjection, coreOptions, createLines, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens, behaviorHint, createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths, searchSocialContext, backupPolicySummary, compactionStats, compactionStatusLine, noteCompaction, noteAutoSummary, compressCallsIn, nativeCompactionsIn, compressToolCallsIn, compressionKindOf, readCompactionLog, appendCompactionRecord, ingestCompactionEvent, compactionRecords, compactionSelfCheck, dutyBoardData, sendHandoff, pullHandoff, listHandoffs, compactionSuiteDetected, listAutoSummaries, deleteAutoSummary, setFactCaller, factOptions, readFactCandidates, writeFactCandidates, pendingFactCandidates, factCandidateStats, factStatusLine, parseFactCandidates, buildFactPrompt, factInventory, isDuplicateFact, extractFactCandidates, acceptFactCandidate, rejectFactCandidate, updateBackupPolicy, updateAutoSummaryPolicy, featuresView, setFeature, memoryOverview, openingUpdate, openingDelete, nowView, updateNowMode, cuepromptView, updateCuePrompt, autoSummaryConfigView, registerBackupApi, hostIsLoopback, readRequestBody, searchMemory, searchMemoryKeyword, searchTokensOf, ensureSearchIndex, bm25ScoreOf, searchTargets, writeMemory, voidMemory, exportArchive, readQqWatchSettings, writeQqWatchSettings, qqWatchView, briefOf, aliasesOf, mergeAliases, writeGuardOf, writeGuardCheck, similarityOf, backupNow, pruneOldSnapshots, shouldSkipBackup, backupStampOf, writeTurnDiary, isCompressionEvent, renameAssetImage, listAssetImages, assetDetail, arrayIndexFiles, arrayIndexFileForMonth, migrateArrayIndexIfNeeded, AUDIO_SOURCE, AUDIO_KIND, AUDIO_USE, audioClassTag, buildStats, tagsOf, validateTags, checkedTags, TAG_VOCAB, clearMemos, tagCard, isVocabTag, normalizeTag, CUSTOM_TAG_MAX, CUSTOM_TAG_LEN, RARE_TAG_MAX_COUNT, recallSession, decodeSessionFile, findSessionFile, archiveSessions, scanSessionOriginals, sessionHeaderOf, findArchivedSession, rawArchiveRows, rawSessionFileName, cwdOfSlug, sha256OfFile, roundsOfSessionFile, relationInjectionLines, archiveRelationOverflow, locateMemory, jsonlHasHash, rebuildGuide, guideStats, guideLinks, guideNodes, addSource, listSources, findSources, sourceStats, loadSources, sourceTag, entryProvenance, sourceIndex, runAutoSummary, pendingTurns, autoSummaryOptions, buildAutoSummaryEntry, buildSummaryPrompt, summaryStyleLine, parseSummaryText, summaryInputOf, callWithThinkingRetry, setAutoSummaryCaller, defaultConfig, loadConfig, AUTO_SUMMARY_PREFIX, createRules, parseRulesMarkdown, formatRuleRow, rulesForSearch, parseTimeBound };
 export default plugin;
 
+
+// v0.44.1（丹阳：「和工具绑定的规则，跟工具一起触发，平时看不见」）：
+// 规则行里写 〔绑定：bili〕 的，只有当 bili_* 这类工具真的在场时才注入；不在场就整行隐藏。
+let schemaProvider = null;
+function activeBinder() {
+  let names = null;
+  try {
+    names = schemaProvider ? schemaProvider() : null;
+  } catch {
+    names = null;
+  }
+  if (!names || !names.length) return null; // 拿不到工具表就不过滤，宁可多给也别漏规矩
+  return (bind) => names.some((n) => n.startsWith(String(bind || "").toLowerCase()));
+}
+function filterBoundRules(text, isActive) {
+  if (!text || !isActive) return text || "";
+  return String(text)
+    .split("\n")
+    .filter((line) => {
+      const m = line.match(/〔绑定[：:]\s*([^〕]+)〕/);
+      if (!m) return true;
+      return m[1].split(/[、,，/\s]+/).filter(Boolean).some((b) => isActive(b));
+    })
+    .join("\n");
+}

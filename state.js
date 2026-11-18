@@ -210,6 +210,21 @@ export function behaviorHint(primary) {
  * 没有用户消息、或全是插件自己注入的，返回 { text: "", skipped }。
  * v0.37（B-84）：抽成独立函数，给「事件触发取记忆」复用；判定逻辑与 updateFromMessages 内联版一致。
  */
+/**
+ * v0.44.1：把框架自己塞进来的噪声从「用户发言」里剥掉。
+ * 之前 <system-reminder> / <puppet_xxx> / [Plugin context …] / [梗百科…] 会被当成用户说的话，
+ * 于是三线状态每步都在变、注入指纹跟着抖，PTC 下一步一次重复注入。
+ */
+export function stripFrameworkNoise(text) {
+  let t = String(text || "");
+  t = t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, " ");
+  t = t.replace(/<puppet_[a-z_]+>[\s\S]*?<\/puppet_[a-z_]+>/gi, " ");
+  t = t.replace(/\[Plugin context from[^\]]*\][\s\S]*?(?=\n\n|$)/gi, " ");
+  t = t.replace(/\[梗百科[^\]]*\][\s\S]*?(?=\n\n|$)/gi, " ");
+  t = t.replace(/^\s*\[[^\]]{0,40}\][\s\S]*$/m, (m) => (/^\s*\[\S/.test(m) ? m : m));
+  return t.replace(/\s+/g, " ").trim();
+}
+
 export function lastUserText(messages = []) {
   const list = Array.isArray(messages) ? messages : [];
   for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -223,9 +238,10 @@ export function lastUserText(messages = []) {
       : Array.isArray(m.content)
         ? m.content.map((b) => (b && b.type === "text" ? b.text || "" : "")).join("\n")
         : "";
-    if (!String(text || "").trim()) continue;
+    const clean = stripFrameworkNoise(text);
+    if (!clean) continue; // 剥完只剩框架噪声，就不算用户发言
     const key = String(m.id || "") || crypto.createHash("sha1").update(`${text}`).digest("hex").slice(0, 12);
-    return { text, key };
+    return { text: clean, key };
   }
   return { text: "", skipped: "no-user-message" };
 }
@@ -630,4 +646,25 @@ export function createLines({ memDir, getConfig = () => null, now = () => Date.n
     anchors,
     findAnchor,
   };
+}
+
+/**
+ * v0.44.1：取最后一条「有正文的助手输出」当注入门牌。
+ * PTC 下一次用户回合里会跑好几个程序，但助手正文只出一次——用它当门，
+ * 同一次输出内的后续步骤就不再重复注入。
+ */
+export function lastAssistantTextId(messages = []) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const m = list[i];
+    if (!m || m.role !== "assistant") continue;
+    const text = typeof m.content === "string"
+      ? m.content
+      : Array.isArray(m.content)
+        ? m.content.map((b) => (b && b.type === "text" ? b.text || "" : "")).join("")
+        : "";
+    if (!String(text || "").trim()) continue;
+    return String(m.id || "") || crypto.createHash("sha1").update(String(text)).digest("hex").slice(0, 12);
+  }
+  return "";
 }
