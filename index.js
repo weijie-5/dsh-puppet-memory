@@ -37,6 +37,7 @@ import zlib from "node:zlib";
 import { createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths } from "./social.js";
 import { behaviorHint, createLines, lastAssistantTextId, lastUserText, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens } from "./state.js";
 import { createPeopleStore } from "./people.js";
+import { createUpdateChecker, UPDATE_REPO } from "./update-check.js";
 import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPaths } from "./sessionmem.js";
 import { createLearn, coreLock, checkAbsurd } from "./learn.js";
 import { createConflictChecker, conflictDefaults } from "./conflict.js";
@@ -3030,6 +3031,29 @@ function qqWatchView() {
   };
 }
 
+// v0.46.0：插件更新检查——**只查版本号与 Release 链接，不下载、不替换**。
+// 状态存在 config.json 的 update 段；没有定时器，只在面板请求时判断是否到期。
+const PLUGIN_VERSION = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8")).version || "";
+  } catch {
+    return "";
+  }
+})();
+
+const updateChecker = createUpdateChecker({
+  repo: UPDATE_REPO,
+  version: PLUGIN_VERSION,
+  store: {
+    get: () => loadConfig().update || null,
+    set: (next) => {
+      const cfg = loadConfig();
+      cfg.update = next;
+      saveConfig(cfg);
+    },
+  },
+});
+
 function registerBackupApi(service) {
   const sendJson = (res, obj, status = 200) => {
     res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
@@ -3060,6 +3084,7 @@ function registerBackupApi(service) {
         if (action === "features") return sendJson(res, featuresView());
         if (action === "overview") return sendJson(res, memoryOverview());
         if (action === "now") return sendJson(res, nowView());
+        if (action === "update-state") return sendJson(res, { ok: true, repo: UPDATE_REPO, ...updateChecker.state() });
         if (action === "qq-watch") return sendJson(res, qqWatchView());
         if (action === "session-memory") {
           const mem = sessionMemory();
@@ -3104,6 +3129,19 @@ function registerBackupApi(service) {
       if (action === "now") {
         const r = updateNowMode(body || {});
         return sendJson(res, r, r.ok ? 200 : 400);
+      }
+      if (action === "update-check") {
+        // 只查不装：返回最新版本与 Release 链接；force=true 时忽略间隔与冷却
+        const r = await updateChecker.check({ force: Boolean(body && body.force) });
+        return sendJson(res, { ...r, message: r.ok ? "已检查" : r.skipped || "检查失败" }, r.ok || r.skipped ? 200 : 502);
+      }
+      if (action === "update-configure") {
+        const patch = {};
+        if (body && body.enabled !== undefined) patch.enabled = body.enabled === true;
+        if (body && body.intervalDays !== undefined) patch.intervalDays = body.intervalDays;
+        if (!Object.keys(patch).length) return sendJson(res, { ok: false, error: "没有要改的字段（enabled / intervalDays）" }, 400);
+        const s = updateChecker.configure(patch);
+        return sendJson(res, { ok: true, ...s, message: "已保存（下次打开面板生效）" });
       }
       if (action === "save-feature") {
         const result = setFeature(body.id, body.enabled);

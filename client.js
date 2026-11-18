@@ -1556,6 +1556,94 @@ window.__ModuleLoader__.load({
         row(mine.pinned ? '值班台：收进「更多」' : '值班台：固定到侧栏', togglePin))
     }
 
+    // ---------------------------------------------------------------
+    // v0.46.0：插件更新（只查不装）
+    // 设置项只有两个：开关 + 间隔；其余都是展示。点「立即检查」才联网。
+    // ---------------------------------------------------------------
+    function UpdatePanel() {
+      const { useState, useEffect, useCallback } = React
+      const [data, setData] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState('')
+
+      const load = useCallback(async () => {
+        try {
+          const res = await callApi('update-state')
+          if (!res || res.ok !== true) throw new Error((res && res.error) || '读取失败')
+          setData(res)
+        } catch (err) {
+          setError(err && err.message ? err.message : String(err))
+        }
+      }, [])
+
+      useEffect(() => { load() }, [load])
+
+      const save = async (patch) => {
+        setError('')
+        const res = await callApi('update-configure', patch)
+        if (res && res.ok === true) setData(res)
+        else setError((res && res.error) || '保存失败')
+      }
+
+      const checkNow = async () => {
+        setBusy(true)
+        setError('')
+        try {
+          const res = await callApi('update-check', { force: true })
+          if (res) setData(res)
+          if (!res || res.ok !== true) setError((res && (res.error || res.message)) || '检查失败')
+        } catch (err) {
+          setError(err && err.message ? err.message : String(err))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      if (error && !data) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-error' }, error))
+      if (!data) return h('div', { className: 'pmb' }, h('div', { className: 'pmb-hint' }, '读取中…'))
+
+      const latest = data.latest
+      const status = data.hasUpdate
+        ? '有新版本 ' + latest.version
+        : (latest ? '已是最新' : '还没查过')
+      const name = 'pmb-update'
+      return h('div', { className: 'pmb', id: name },
+        h('div', { className: 'pmb-title' }, '插件更新'),
+        h('div', { className: 'pmb-hint' }, '只查 GitHub 上的稳定版，只显示版本号和链接；不会下载、也不会替换插件。'),
+        h('div', { className: 'pmb-card' },
+          h(Row, { label: '当前版本' }, h('div', null, data.currentVersion || '(未读到)')),
+          h(Row, { label: '最新版' }, h('div', null,
+            status,
+            latest && latest.url
+              ? h('a', { href: latest.url, target: '_blank', rel: 'noreferrer', style: { marginLeft: '8px' } }, '打开 Release')
+              : null,
+          )),
+          h(Row, { label: '自动检查' },
+            h('button', {
+              type: 'button', className: 'pmb-btn',
+              onClick: () => save({ enabled: data.enabled !== true }),
+            }, data.enabled === true ? '开' : '关'),
+            h('span', { className: 'pmb-hint' }, '每'),
+            h('select', {
+              className: 'pmb-input', value: String(data.intervalDays || 7),
+              onChange: (e) => save({ intervalDays: Number(e.target.value) }),
+            }, [1, 3, 7, 14, 30].map((d) => h('option', { key: d, value: String(d) }, d + ' 天'))),
+            h('span', { className: 'pmb-hint' }, '查一次'),
+          ),
+          h(Row, { label: '上次检查' },
+            h('div', null, data.lastCheckedAt ? relTime(data.lastCheckedAt) : '还没查过'),
+            data.nextCheckAt ? h('span', { className: 'pmb-hint', style: { marginLeft: '8px' } }, '（下次约 ' + fmtLocal(data.nextCheckAt) + '）') : null,
+          ),
+          data.lastError ? h(Row, { label: '上次错误' }, h('div', { className: 'pmb-error' }, data.lastError)) : null,
+          h('div', { className: 'pmb-actions' },
+            h('button', { type: 'button', className: 'pmb-btn', disabled: busy, onClick: checkNow },
+              busy ? '检查中…' : '立即检查'),
+            h('span', { className: 'pmb-hint' }, '检查完只看结果，装不装由你决定。'),
+          ),
+        ),
+        error ? h('div', { className: 'pmb-error' }, error) : null,
+      )
+    }
     function apply(ctx) {
       if (typeof document !== 'undefined') {
         const style = document.createElement('style')
@@ -1574,6 +1662,12 @@ window.__ModuleLoader__.load({
         slots.register(
           { name: 'settings.section', id: 'puppet-memory', order: 25, label: '记忆设置' },
           () => h(MemorySettingsPanel),
+        )
+
+        // v0.46.0：插件更新单独一页——它跟记忆数据无关，不该挤进「记忆设置」
+        slots.register(
+          { name: 'settings.section', id: 'puppet-update', order: 28, label: '插件更新' },
+          () => h(UpdatePanel),
         )
 
         // 值班台：侧栏面板行（sidebar.panellist 才进侧栏列表、才有固定状态）
