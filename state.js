@@ -185,11 +185,24 @@ export function qualitativeOf(normalized) {
   return { primary: first, label: `${LINE_LABEL[first]}优先` };
 }
 
+// v0.43.1（2026-11-18）：「工具的触发绑定状态，不同工具用的方向不一样」——
+// 每条线除了说话方式，还带一句「这段时间哪种工具是对的方向」。它只是方向提示，
+// 不改工具集（工具集是启动时定的，热加载做不到）。
+const TOOL_DIRECTIONS = {
+  work: "工具方向：改文件、跑命令、查数据这类推进用的。",
+  companion: "工具方向：表情包、记忆检索这类陪着用的；别上重型工具。",
+  learning: "工具方向：检索、查证、梗百科这类补依据用的。",
+};
 export function behaviorHint(primary) {
-  if (primary === "companion") return "先接住情绪，别急着给方案；任务类话题可以放后面。";
-  if (primary === "work") return "先把事情推进到位，别绕；情绪类话题简短接住就行。";
-  if (primary === "learning") return "多给依据和出处，说清楚不确定的地方；别只给结论。";
-  return "按话题走，工作就推进、情绪就先接。";
+  const base = (() => {
+    if (primary === "companion") return "先接住情绪，别急着给方案；任务类话题可以放后面。";
+    if (primary === "work") return "先把事情推进到位，别绕；情绪类话题简短接住就行。";
+    if (primary === "learning") return "多给依据和出处，说清楚不确定的地方；别只给结论。";
+    return "按话题走，工作就推进、情绪就先接。";
+  })();
+  const dir = TOOL_DIRECTIONS[primary]
+    || (LINE_LABEL[primary] ? `工具方向：${LINE_LABEL[primary]}相关的；没配工具就手动 tune 或先开对应插件。` : "");
+  return dir ? `${base} ${dir}` : base;
 }
 
 /**
@@ -217,13 +230,39 @@ export function lastUserText(messages = []) {
   return { text: "", skipped: "no-user-message" };
 }
 
+// v0.43.1（2026-11-18 丹阳：「三线是三种范围不是三种了，得能自己改」）：
+// 允许在 config 里加自定义线——不给词表就只能手动 tune，不会假装能自动识别。
+// 写法（~/.dsh/memory/config.json）：
+//   "state": { "lines": { "defs": { "novel": { "label": "小说", "terms": [["写小说",1.0],["章节",0.8]] } } } }
+let appliedLineSig = "";
+export function applyLineSet(linesCfg) {
+  const defs = (linesCfg && linesCfg.defs) || {};
+  const sig = JSON.stringify(defs);
+  if (sig === appliedLineSig) return;
+  appliedLineSig = sig;
+  for (const [id, def] of Object.entries(defs)) {
+    const key = String(id || "").trim();
+    if (!key) continue;
+    if (!LINES.includes(key)) LINES.push(key);
+    LINE_LABEL[key] = String((def && def.label) || key).slice(0, 12);
+    const terms = Array.isArray(def && def.terms) ? def.terms : [];
+    LINE_TERMS[key] = terms
+      .map((t) => (Array.isArray(t) ? [String(t[0] || ""), Number(t[1]) || 0.6] : [String(t || ""), 0.6]))
+      .filter(([term]) => term);
+    if (!(key in DEFAULT_LINES.baseline)) DEFAULT_LINES.baseline[key] = Number(def && def.baseline) || 0.2;
+    if (!(key in DEFAULT_LINES.halfLifeMinutes)) DEFAULT_LINES.halfLifeMinutes[key] = Number(def && def.halfLifeMinutes) || 60;
+  }
+}
+
 export function createLines({ memDir, getConfig = () => null, now = () => Date.now() } = {}) {
   if (!memDir) throw new Error("createLines 需要 memDir");
   const paths = linesPaths(memDir);
 
   const cfgOf = () => {
     const cfg = getConfig();
-    return { ...JSON.parse(JSON.stringify(DEFAULT_LINES)), ...((cfg && cfg.lines) || {}) };
+    const lines = (cfg && cfg.lines) || {};
+    applyLineSet(lines); // 自定义线：先把线表挂上，后续 normalize / 关键词识别都按新表走
+    return { ...JSON.parse(JSON.stringify(DEFAULT_LINES)), ...lines, baseline: { ...DEFAULT_LINES.baseline, ...(lines.baseline || {}) }, halfLifeMinutes: { ...DEFAULT_LINES.halfLifeMinutes, ...(lines.halfLifeMinutes || {}) } };
   };
 
   function ensure() {

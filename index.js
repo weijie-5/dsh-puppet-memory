@@ -693,7 +693,7 @@ function defaultConfig() {
       mode: "every-step",
       // v0.22 核心记忆：behavior/core.md 小文件，默认「缺就补」地每步注入，600 字预算。
       // 它先从 maxChars 总预算里扣，开核心卡不会让注入总量变长；关掉不影响旧行为。
-      core: { enabled: true, maxChars: 600, everyStep: true, state: { enabled: true, maxChars: 150 }, rules: { enabled: true, maxChars: 400 }, levels: { core: "strong", rules: "strong", state: "weak", self: "weak" } },
+      core: { enabled: true, maxChars: 600, everyStep: true, state: { enabled: true, maxChars: 300 }, rules: { enabled: true, maxChars: 400 }, levels: { core: "strong", rules: "strong", state: "weak", self: "weak" } },
   // 时间提示（v1.3，2026-11-17）：插件自己的钩子，零模型成本。mode=gap（隔久才给）/ recall（跟着回忆走）/ both / off
   now: { mode: "gap", gapMinutes: 10 },
   // 四张卡的注入强度（v1.4，2026-11-17 丹阳）：strong=全文 弱=pocket 只留一句提示；
@@ -1337,7 +1337,7 @@ function coreOptions(cfg) {
   const opt = { ...defaultConfig().inject.core, ...((cfg && cfg.inject && cfg.inject.core) || {}) };
   const budget = Math.max(100, Number(opt.maxChars) || 600);
   const stateOpt = { ...(defaultConfig().inject.core.state || {}), ...((opt && opt.state) || {}) };
-  const state = { enabled: stateOpt.enabled !== false, budget: Math.max(60, Number(stateOpt.maxChars) || 150) };
+  const state = { enabled: stateOpt.enabled !== false, budget: Math.max(60, Number(stateOpt.maxChars) || 300) }; // 2026-11-18：状态卡实际从没上过 300，按 300 封顶即可
   const rulesOpt = { ...(defaultConfig().inject.core.rules || {}), ...((opt && opt.rules) || {}) };
   const rules = { enabled: rulesOpt.enabled !== false, budget: Math.max(100, Number(rulesOpt.maxChars) || 400) };
   const levelsRaw = { ...(defaultConfig().inject.core.levels || {}), ...((opt && opt.levels) || {}) };
@@ -2057,6 +2057,18 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
       })
       .join("；");
     parts.push(`【最近日记】${clip(line, 420)}`);
+  }
+
+  // v0.43.1：「没启用的工具只发简要说明」——一句话清单，省掉整套 schema 的钱，
+  // 模型知道有什么可开，需要时说一句再去开（开完要重启，这点如实说）。
+  try {
+    const mp = path.join(os.homedir(), ".dsh", "tools-manifest.json");
+    const man = JSON.parse(fs.readFileSync(mp, "utf8"));
+    if (Array.isArray(man.off) && man.off.length) {
+      parts.push(`【未启用工具】${man.off.join("；")}（要用先开插件并重启，别假装能用）`);
+    }
+  } catch {
+    /* 没有清单就不提 */
   }
 
   if (!parts.length) return "";
@@ -3513,6 +3525,21 @@ function searchSocialContext(social, args = {}) {
 // v0.34（B-52）：要点层——从一条记忆里压出一句能扫读的话（抽取式，不调模型、零成本）。
 // 只取第一句、去掉标记和层前缀、超长截断；原文仍在，要点只是索引。
 const BRIEF_MAX_CHARS = 60;
+// v0.43.1（2026-11-17 评测发现）：命中渲染只给正文，绝不把整行 JSONL 贴进上下文。
+// 背景：renderHit / 按层列举以前直接用 doc.line（整行 JSON），88 道评测题里 85 道
+// 都带着 {"kind":"note","ts":...} 这种噪声进上下文——白占预算，还不带信息。
+function displayTextOf(entry) {
+  const e = entry && typeof entry === "object" ? entry : {};
+  // v0.43.2：keyword 是 relation/saying 条目的主键兼标题（用户和评测都靠它认条目）。
+  // 以前整行 JSONL 里带着它，只取正文时不能丢——丢了就变成「只看见释义、不知道在说哪个词」，
+  // 按标签/多词/排序类的检索结果也没法核对是命中了哪一条。正文里已经含 keyword 时不重复。
+  const body = e.text || e.meaning || e.card || e.brief || e.user || e.assistant || e.title || "";
+  const keyword = e.keyword ? String(e.keyword) : "";
+  const pick = keyword && body ? (String(body).includes(keyword) ? body : `${keyword}＝${body}`) : keyword || body;
+  const s = String(pick).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return s;
+}
+
 function briefOf(entry, max = BRIEF_MAX_CHARS) {
   const raw = String(
     (entry && (entry.brief || entry.text || entry.meaning || entry.user || entry.assistant || entry.keyword)) || "",
@@ -3638,7 +3665,9 @@ function searchMemoryKeyword(query, layer, limit, tag, includeVoided = false) {
         readText(file)
           .split(/\r?\n/)
           .forEach((line, index) => {
-            if (line.trim()) listed.push(`${rel(file)}:${index + 1}  ${clip(line, 300)}`);
+            if (!line.trim()) return;
+            const shown = displayTextOf(parseJsonlLine(line));
+            if (shown) listed.push(`${rel(file)}:${index + 1}  ${clip(shown, 300)}`);
           });
       }
       if (!listed.length) return layer === "memo" ? "便签是空的。" : "用户档案还是空的。";
@@ -4224,7 +4253,7 @@ function formatSearchHit(doc, srcIdx) {
   const voidMark = entry?.voided ? `〔已标废：${clip(String(entry.voided.reason || ""), 40)}〕` : "";
   // v0.37（B-74）：已结束的条目照样能查回，但必须标出来——「真但过期」不是「假的」
   const endedMark = doc.ended ? `〔已结束：${clip(String(doc.ended.reason || ""), 30)}${doc.ended.at ? ` · ${String(doc.ended.at).slice(0, 10)}` : ""}〕` : "";
-  return `${where}:${doc.lineNo}  ${endedMark}${voidMark}${statePrefixOf(entry)}${clip(doc.line, 300)}${hs}${suffix}${provenance ? `  ${provenance}` : ""}`;
+  return `${where}:${doc.lineNo}  ${endedMark}${voidMark}${statePrefixOf(entry)}${clip(displayTextOf(entry), 300)}${hs}${suffix}${provenance ? `  ${provenance}` : ""}`;
 }
 
 // v0.37（B-77）：规则册实例。模块级单例，apply 里复用同一份，检索/工具都走它。
@@ -4381,7 +4410,9 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
           readText(file)
             .split(/\r?\n/)
             .forEach((line, index) => {
-              if (line.trim()) listed.push(`${rel(file)}:${index + 1}  ${clip(line, 300)}`);
+              if (!line.trim()) return;
+              const shown = displayTextOf(parseJsonlLine(line));
+              if (shown) listed.push(`${rel(file)}:${index + 1}  ${clip(shown, 300)}`);
             });
         }
       }
@@ -6086,6 +6117,45 @@ function buildStats() {
     fileStats.push(line);
   } catch {
     /* 已结束统计失败不影响其它统计 */
+  }
+
+  // v0.43.1（2026-11-17 丹阳：要数字，不要花里胡哨的图）：记忆水位。
+  // 一句能看懂、且能直接照着动手的句子：多少条、多少天没动、多少已过期、多少标废。
+  // 诚实边界：useCount 一直是死字段（全插件没有地方 +1），所以「多久没动」按**最后写入时间**算，
+  // 不是「最后被检索时间」——措辞里写清楚，不假装有使用数据。
+  try {
+    const idx = ensureSearchIndex();
+    const docs = idx.docs || [];
+    const nowMs = Date.now();
+    const monthStart = (() => {
+      const d = new Date();
+      return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+    })();
+    let entries = 0, turns = 0, fresh = 0, stale = 0, expired = 0, voidedN = 0;
+    for (const doc of docs) {
+      const relPath = rel(doc.file || "");
+      // 索引/指针行不是记忆条目：guide 是检索索引，array 是会话索引——都不该算进水位
+      if (relPath.startsWith("deep/guide") || relPath.startsWith("array/")) continue;
+      const isDiary = relPath.startsWith("behavior/diary/");
+      if (isDiary) {
+        turns += 1;
+        continue;
+      }
+      entries += 1;
+      const ts = Number(doc.ts) || 0;
+      if (ts && ts >= monthStart) fresh += 1;
+      if (!ts || ts < nowMs - 30 * 86400000) stale += 1;
+      const untilMs = Date.parse(String(doc.entry?.until || ""));
+      if (Number.isFinite(untilMs) && untilMs < nowMs) expired += 1;
+      if (doc.entry?.voided) voidedN += 1;
+    }
+    const pct = entries ? Math.round((stale / entries) * 100) : 0;
+    fileStats.push(
+      `记忆水位：条目 ${entries}｜本月新增 ${fresh}｜30 天没动过 ${stale}（${pct}%）｜已到期 ${expired}｜标废 ${voidedN}（"没动过"按最后写入时间算；目前没有"最后被检索"的记录）`,
+    );
+    if (turns) fileStats.push(`日记回合 ${turns} 条（原文另存 sessions/，备份会一起带走）`);
+  } catch {
+    /* 水位统计失败不影响其它统计 */
   }
 
   const cfg = loadConfig();
@@ -8247,9 +8317,9 @@ function apply(ctx) {
           return decision;
         }
         lastInjected.set(sessionId, digest);
-        if (rulesForInject) lastRulesInjected.set(sessionId, rulesDigest);
-        if (coreText) lastCoreInjected.set(sessionId, coreDigest);
-        if (coreStateForInject) lastCoreStateInjected.set(sessionId, coreStateDigest);
+        if (rulesForInject) lastRulesInjected.set(sessionId, sha1(rulesForInject));
+        if (coreText) lastCoreInjected.set(sessionId, sha1(coreText));
+        if (coreStateForInject) lastCoreStateInjected.set(sessionId, sha1(coreStateForInject));
         if (stateForInject) lastStateInjected.set(sessionId, stateDigest);
         if (injectMode === "first-step") injectedOnce.add(sessionId);
         // B-47：复位带的临时约束注入一次就删——不能每轮念，也不许写进任何文件
@@ -8511,7 +8581,40 @@ ${selfText}
       render: (_args, value) => [{ type: "text", text: String(value) }],
     };
 
+    // v0.45.0 按需拆开：常用工具启动即注册，长尾先排队，等 tools_switch action=on pkg=memory-tail 再展开。
+    // 逃生门：环境变量 MEMORY_TOOLSET=full 时全部启动即注册（老行为）。
+    const HOT_TOOLS = new Set([
+      "memory_write",
+      "memory_search",
+      "memory_core",
+      "memory_pickup",
+      "memory_stats",
+      "memory_doctor",
+      "memory_state",
+      "memory_locate",
+      "memory_void",
+      "tools_switch",
+    ]);
+    const fullToolset = String(process.env.MEMORY_TOOLSET || "").toLowerCase() === "full";
+    const queuedTools = [];
+    const flushQueuedTools = () => {
+      const n = queuedTools.length;
+      for (const def of queuedTools.splice(0)) {
+        try {
+          toolCtx.tools.register(def);
+          diag(`工具注册成功：${def.name}（长尾展开）`);
+        } catch (err) {
+          diag(`工具注册失败：${def.name} → ${err?.stack || err}`);
+        }
+      }
+      return n;
+    };
     const register = (definition) => {
+      const name = definition?.name;
+      if (!fullToolset && name && !HOT_TOOLS.has(name)) {
+        queuedTools.push(definition);
+        return;
+      }
       try {
         toolCtx.tools.register(definition);
         diag(`工具注册成功：${definition.name}`);
@@ -9144,7 +9247,7 @@ ${selfText}
     register({
       name: "memory_core",
       description:
-        "核心记忆拆三个文件（都常驻注入、压缩后自动补回，优先级高于其它记忆）：①behavior/core.md = 不会经常变的内容（称呼约定、用户、能力），600 字预算；②behavior/core-rules.md = 行为规则（说话方式、红线、约定），400 字预算，**只在规则改过或压缩后各注入一次**，状态变化不会把规则再提醒一遍；③behavior/core-state.md = 会变的状态（当前主线、进度、待办），150 字预算。三份分开截断、分开报字数。action=get 读 | set 覆盖写（text，超过硬上限 2×预算会被拒）| append 追加一行 | clear 清空（先归档到 behavior/archive/core*.md）| **reset 一句话复位**（清本会话注入指纹→下一步把三张卡重新注入一次；text 可带一句临时约束，只对本次会话生效、注入一次即弃、不写任何文件）。target=core（默认）| rules | state。不要写成日记或流水账。**主人锁（v1.0）**：以「[主人]」开头的行受保护——set/clear 若删改它们会被拒绝，确需改动要显式带 ownerRelease=true；append 加 owner=true 会把这一行标成主人行。",
+        "核心记忆拆三个文件（都常驻注入、压缩后自动补回，优先级高于其它记忆）：①behavior/core.md = 不会经常变的内容（称呼约定、用户、能力），600 字预算；②behavior/core-rules.md = 行为规则（说话方式、红线、约定），400 字预算，**只在规则改过或压缩后各注入一次**，状态变化不会把规则再提醒一遍；③behavior/core-state.md = 会变的状态（当前主线、进度、待办），300 字预算（封顶，实际用不满）。三份分开截断、分开报字数。action=get 读 | set 覆盖写（text，超过硬上限 2×预算会被拒）| append 追加一行 | clear 清空（先归档到 behavior/archive/core*.md）| **reset 一句话复位**（清本会话注入指纹→下一步把三张卡重新注入一次；text 可带一句临时约束，只对本次会话生效、注入一次即弃、不写任何文件）。target=core（默认）| rules | state。不要写成日记或流水账。**主人锁（v1.0）**：以「[主人]」开头的行受保护——set/clear 若删改它们会被拒绝，确需改动要显式带 ownerRelease=true；append 加 owner=true 会把这一行标成主人行。",
       parameters: {
         type: "object",
         properties: {
@@ -9564,6 +9667,227 @@ ${selfText}
           return buildStats();
         } catch (err) {
           return `统计失败：${err?.message || err}`;
+        }
+      },
+    });
+
+
+    // v0.44.0 工具开关：list / on / off 一个入口管到底（技能开关交给 dsh-skillswitch，不重复造）。
+    register({
+
+      name: "tools_switch",
+      description: "工具开关。action=list 列出「已装载 / 可按需热装载 / 要关得改配置重启」三类；action=on pkg=… 当场把某个已装但启动时关掉的插件工具集展开（白名单）；action=off pkg=… 会如实说明运行中关不掉并给出改 bundles 的命令（不假装能关）。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list（默认）/ on / off" },
+          pkg: { type: "string", description: "包名，如 dsh-novel-forge" },
+        },
+      },
+      output,
+      async execute(args) {
+        const CONFIGS = {
+          "dsh-novel-forge": { minChapterChars: 2000, maxChapterChars: 4000, contextBudgetChars: 6000, scanTopK: 8, repetitionWindow: 10, skipPresetDeploy: true },
+        };
+        const ALLOW = ["dsh-novel-forge", "dsh-video-storyboard", "dsh-bili-scroll", "dsh-mindmap", "dsh-image-gen", "dsh-skill-hub"];
+        const action = String(args?.action || "list").trim().toLowerCase();
+        const profile = path.join(os.homedir(), ".dsh", "profiles", "desktop");
+        const readBundles = () => {
+          try {
+            const p = JSON.parse(fs.readFileSync(path.join(profile, "package.json"), "utf8"));
+            return (p.dsh && p.dsh.profile && p.dsh.profile.bundles) || [];
+          } catch { return []; }
+        };
+        const installed = () => {
+          try {
+            return fs.readdirSync(path.join(profile, "node_modules")).filter((n) => n.startsWith("dsh-") || n.startsWith("@"));
+          } catch { return []; }
+        };
+
+        if (action === "list") {
+          const bundles = readBundles();
+          let man = {};
+          try { man = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".dsh", "tools-manifest.json"), "utf8")); } catch {}
+          const inst = installed();
+          const off = Array.isArray(man.off) ? man.off : [];
+          const hot = ALLOW.filter((p) => inst.includes(p) && !bundles.includes(p));
+          const out = [];
+          out.push(`【工具开关】bundles ${bundles.length} 项` + (man.primary ? `｜三线取向：${man.primary}` : ""));
+          out.push("");
+          out.push(`已装载（启动即生效，${bundles.length}）：`);
+          out.push("  " + bundles.join(", "));
+          if (off.length) {
+            out.push("");
+            out.push(`未启用（${off.length}，各一句话）：`);
+            for (const o of off) out.push("  · " + o);
+          }
+          out.push("");
+          out.push(`可按需热装载（${hot.length}）：`);
+          if (hot.length) for (const p of hot) out.push("  → tools_switch action=on pkg=" + p);
+          else out.push("  (无；白名单外的包要先加进 ALLOW)");
+          out.push("");
+          out.push("要真关掉 → 从当前 profile 的 package.json（dsh.profile.bundles）里删掉那个包名，然后重启（运行中没有 unregister API）");
+          return out.join("\n");
+        }
+
+        if (action === "off") {
+          const pkg = String(args?.pkg || "").trim();
+          if (!pkg) return "给个包名：tools_switch action=off pkg=…";
+          return [
+            `运行中关不掉「${pkg}」——宿主没有 unregister API，工具一旦注册就活到进程结束。`,
+            "要关请改 bundles 再重启：",
+            `  从 dsh.profile.bundles 数组里删掉「${pkg}」，存盘后重启`,
+            "（反方向 on 同理；改完必须重启才生效）",
+          ].join("\n");
+        }
+
+        if (action === "on") {
+          const pkg = String(args?.pkg || "").trim();
+          if (pkg === "memory-tail") {
+            const n = flushQueuedTools();
+            return n ? `已展开记忆长尾工具 ${n} 个（下一轮可调用）` : "长尾工具已经全部展开过了";
+          }
+          if (!ALLOW.includes(pkg)) return `不在白名单：${pkg || "(空)"}；可热装的：${ALLOW.join(" / ")} / memory-tail`;
+          try {
+            const base = path.join(os.homedir(), ".dsh", "profiles", "desktop", "node_modules", pkg);
+            const man = JSON.parse(fs.readFileSync(path.join(base, "package.json"), "utf8"));
+            const ex = man.exports && man.exports["."];
+            const rel = (typeof ex === "string" && ex) || (ex && (ex.import || ex.default)) || man.main || "index.js";
+            const file = path.join(base, String(rel).replace(/^\.\//, ""));
+            const { pathToFileURL } = await import("node:url");
+            const mod = await import(pathToFileURL(file).href);
+            const loaded = [];
+            const real = toolCtx;
+            const proxied = new Proxy(real, {
+              get(target, prop) {
+                if (prop === "tools") {
+                  const t = target.tools || {};
+                  return { ...t, register: (def) => { if (def && def.name) loaded.push(def.name); return t.register(def); } };
+                }
+                const v = target[prop];
+                return typeof v === "function" ? v.bind(target) : v;
+              },
+            });
+            const applyFn = mod.apply || (mod.default && (mod.default.apply || mod.default));
+            if (typeof applyFn !== "function") return `装载失败：${pkg} 没有可调用的 apply()`;
+            const cfg = CONFIGS[pkg] || {};
+            const attempts = [];
+            const paths = [];
+            if (typeof toolCtx.plugin === "function") {
+              paths.push(["ctx.plugin(mod)", () => toolCtx.plugin(mod, cfg)]);
+              paths.push(["ctx.plugin(apply)", () => toolCtx.plugin(applyFn, cfg)]);
+            } else {
+              attempts.push("ctx.plugin 不存在");
+            }
+            paths.push(["apply(proxy)", () => applyFn(proxied, cfg)]);
+            let via = "";
+            for (const [label, run] of paths) {
+              loaded.length = 0;
+              try { await run(); attempts.push(label + " ✓ " + loaded.length + " 工具"); via = label; break; }
+              catch (err) { attempts.push(label + " ✗ " + (err?.message || err)); }
+            }
+            if (!via) return "装载失败：" + attempts.join(" ｜ ");
+            return `已装载 ${pkg}（via ${via}）：${loaded.length || "?"} 个工具可用`;
+          } catch (err) {
+            return `装载失败：${err?.message || err}`;
+          }
+        }
+
+        return `不认识的 action：${action}（只认 list / on / off）`;
+      },
+    });
+
+
+    register({
+
+      name: "memory_pickup",
+      description:
+        "确定性读回自己的记忆：三张常驻卡（核心/规则/状态）+ 自我层最近几条 + 最近几天日记片段，原样返回。**上下文被压缩之后、换了新会话、或用户问「你还记得吗/之前那个」时用它**——它不检索、不猜，只把已经在盘上的东西读回来（和「让模型自己想起来」是两件事）。比记忆注入更可靠的地方是：它是被明确调用的，不依赖模型自觉。",
+      parameters: {
+        type: "object",
+        properties: {
+          days: { type: "number", description: "读最近几天的日记（默认 3，最多 14）" },
+          maxChars: { type: "number", description: "总字数上限（默认 5000，最少 1000）" },
+        },
+      },
+      output,
+      async execute(args) {
+        try {
+          ensureDirs();
+          const days = Math.max(1, Math.min(14, Number(args?.days) || 3));
+          const cap = Math.max(1000, Math.min(16000, Number(args?.maxChars) || 5000));
+          const readIf = (p) => {
+            try {
+              return fs.readFileSync(p, "utf8").trim();
+            } catch {
+              return "";
+            }
+          };
+          const core = readIf(path.join(PATHS.behavior, "core.md"));
+          const rules = readIf(path.join(PATHS.behavior, "core-rules.md"));
+          const state = readIf(path.join(PATHS.behavior, "core-state.md"));
+          // 自我层：取最近 6 条正文
+          let selfLines = [];
+          try {
+            const rows = readJsonl(path.join(PATHS.behavior, "self.jsonl")).filter((e) => e && !e.voided);
+            selfLines = rows.slice(-6).map((e) => `· ${clip(String(e.text || ""), 120)}`);
+          } catch {
+            /* 没有自我层就跳过 */
+          }
+          // 最近 N 天日记（turn 条目，按 ts 升序，最多 40 条）
+          const cutoff = Date.now() - days * 86400000;
+          const turns = [];
+          try {
+            for (const file of dirJsonl(PATHS.diaryDir)) {
+              for (const e of readJsonl(file)) {
+                if (!e || e.kind !== "turn") continue;
+                const ts = Date.parse(String(e.ts || ""));
+                if (!Number.isFinite(ts) || ts < cutoff) continue;
+                turns.push({ ts, text: `${String(e.user || "")} / ${String(e.assistant || "")}` });
+              }
+            }
+          } catch {
+            /* 日记读不到就只给三卡 */
+          }
+          turns.sort((a, b) => a.ts - b.ts);
+          const picked = turns.slice(-40);
+          const parts = [
+            `【读回记忆】${new Date().toLocaleString("zh-CN", { hour12: false })}｜最近 ${days} 天`,
+            "这是把盘上已有的东西原样读回来（不是新检索，也不是新注入）。",
+            "",
+            `一、核心卡（${core.length} 字）`,
+            core || "（空）",
+            "",
+            `二、规则卡（${rules.length} 字）`,
+            rules || "（空）",
+            "",
+            `三、状态卡（${state.length} 字）`,
+            state || "（空）",
+          ];
+          if (selfLines.length) parts.push("", "四、自我层（最近 6 条）", ...selfLines);
+          if (picked.length) {
+            // 预算感知：先算前面四块用掉多少，剩下的才给日记——宁可少给几条，也不要在句子中间截断
+            const used = parts.join("\n").length;
+            const room = Math.max(600, cap - used - 120);
+            const lines = [];
+            let spent = 0;
+            for (const t of picked) {
+              const d = new Date(t.ts);
+              const hm = `${String(d.getMonth() + 1)}-${String(d.getDate())} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+              const line = `· ${hm} ${clip(t.text.replace(/\s+/g, " "), 110)}`;
+              if (spent + line.length > room && lines.length >= 5) break;
+              lines.push(line);
+              spent += line.length + 1;
+            }
+            parts.push("", `五、最近 ${days} 天日记（共 ${picked.length} 条，这里给最近 ${lines.length} 条；要更多就把 days 调小或 maxChars 调大）`, ...lines);
+          } else {
+            parts.push("", `五、最近 ${days} 天没有日记回合（可能真没聊，也可能日记没写）`);
+          }
+          let out = parts.join("\n");
+          if (out.length > cap) out = `${out.slice(0, cap)}\n\n…（超过 ${cap} 字被截断；要更多就调 maxChars，或单独读某一层）`;
+          return out;
+        } catch (err) {
+          return `读回失败：${err?.message || err}`;
         }
       },
     });

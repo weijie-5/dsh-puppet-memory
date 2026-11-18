@@ -34,19 +34,54 @@ try {
   const cfg = loadConfig();
   const inj = buildInjectionText(cfg, 0);
 
-  // ---- 【现在】行 ----
   const lines = inj.split("\n");
-  const nowLine = lines.find((l) => l.startsWith("【现在】"));
-  ok("注入里有【现在】行", !!nowLine, inj.slice(0, 60));
+
+  // ---- 【现在】行 ----
+  // 2026-11-18：v1.2 起时间不再进 buildInjectionText（每轮都变会让注入指纹每轮都不同），
+  // 改由 pre-step 的独立 <puppet_now>（10 分钟节流）负责；要验时间行就得真跑 apply + pre-step。
+  const handlers = new Map();
+  const ctx = {
+    on(e, f) {
+      if (!handlers.has(e)) handlers.set(e, []);
+      handlers.get(e).push(f);
+      return () => {};
+    },
+    tools: { register: () => {} },
+    effect(fn) {
+      try {
+        fn();
+      } catch {
+        /* 忽略 */
+      }
+    },
+    get: () => null,
+    inject() {},
+  };
+  mod.apply(ctx);
+  const preStep = handlers.get("agent/pre-step")?.[0];
+  ok("pre-step 注册上了", typeof preStep === "function");
+  const agent = { session: { header: { id: "now-s1", cwd: "E:/tmp", origin: "web" }, snapshotEvents: () => [], events: [] }, ctx: { get: () => null } };
+  const runStep = async () => {
+    const d = await preStep(
+      { agent },
+      async () => ({ kind: "enter", messages: [{ role: "user", content: [{ type: "text", text: "现在几点" }] }] }),
+    );
+    return (d?.messages || []).map((m) => (Array.isArray(m.content) ? m.content.map((b) => b.text || "").join("") : String(m.content || "")));
+  };
+  const turn1 = await runStep();
+  const nowMsg = turn1.find((t) => t.startsWith("【现在】")) || "";
+  const nowLine = nowMsg.split("\n")[0] || "";
+  ok("注入里有【现在】行", !!nowLine, turn1.join("|").slice(0, 120));
   const m = nowLine ? nowLine.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/) : null;
-  ok("【现在】格式为 YYYY-MM-DD HH:mm", !!m, nowLine || "");
+  ok("【现在】格式为 YYYY-MM-DD HH:mm", !!m, nowLine);
   if (m) {
     const asDate = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
     ok("【现在】与本机时钟同分钟", Math.abs(Date.now() - asDate.getTime()) < 60000);
   }
-  ok("【现在】紧跟块头（正文第一条）", lines[2] === nowLine, lines[2]);
-  ok("【现在】排在人设前面", inj.indexOf("【现在】") < (inj.includes("【人设】") ? inj.indexOf("【人设】") : Infinity));
-  ok("【现在】带时区", /（.+）$/.test(nowLine || ""), nowLine || "");
+  ok("【现在】是独立时间块的第一条", nowMsg.startsWith("【现在】"), nowMsg.slice(0, 60));
+  const personaIdx = turn1.findIndex((t) => t.includes("【人设】"));
+  ok("【现在】排在人设前面", personaIdx < 0 || turn1.indexOf(nowMsg) < personaIdx, turn1.map((t) => t.slice(0, 8)).join("|"));
+  ok("【现在】带时区", /（.+）$/.test(nowLine), nowLine);
 
   // ---- 拿不到时间就不写 ----
   ok("时钟坏掉时 formatNowLine 返回空串", formatNowLine(NaN) === "");
@@ -64,11 +99,11 @@ try {
   ok("日记行带相对时长", /天前|小时前|刚刚/.test(diaryLine), diaryLine);
   ok("日记行仍保留月-日戳", /\[\d{2}-\d{2}/.test(diaryLine), diaryLine);
 
-  // ---- 屏蔽块 ----
-  const suppressed = new Set(["now"]);
-  const noNow = buildInjectionText(cfg, 0, null, { suppressed });
-  ok("屏蔽 now 后没有【现在】行", !noNow.split("\n").some((l) => l.startsWith("【现在】")));
-  ok("屏蔽 now 不影响其它块", noNow.includes("【人设】") || noNow.includes("【最近日记】"));
+  // ---- 10 分钟节流 ----
+  // 2026-11-18：时间行已经不在 buildInjectionText 里，没有可屏蔽的 now 块了；它现在按 10 分钟节流，
+  // 同一会话紧接着再跑一次不该再给时间——这比「屏蔽」更接近现在的设计。
+  const turn2 = await runStep();
+  ok("同一会话紧接着再跑：不重复注入【现在】", !turn2.some((t) => t.startsWith("【现在】")), turn2.join("|").slice(0, 80));
 } finally {
   fs.rmSync(TMP, { recursive: true, force: true });
 }
