@@ -36,6 +36,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { createSocial, detectScene, normalizeName, personIdOf, registerSocialTools, sceneLabel, socialConfigDefaults, socialPaths } from "./social.js";
 import { behaviorHint, createLines, lastAssistantTextId, lastUserText, lexicalScore, linesConfigDefaults, linesPaths, qualitativeOf, topicTokens } from "./state.js";
+import { createPeopleStore } from "./people.js";
 import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPaths } from "./sessionmem.js";
 import { createLearn, coreLock, checkAbsurd } from "./learn.js";
 import { createConflictChecker, conflictDefaults } from "./conflict.js";
@@ -7858,6 +7859,19 @@ function apply(ctx) {
     });
   });
 
+  // v0.45.0「重要的人」：一人一张名片，提及时才注入；90 天不提自动冷宫。
+  let peopleStoreRef = null;
+  const peopleInjected = new Map(); // sessionId -> Map(name -> turn)
+  function getPeopleStore() {
+    if (!peopleStoreRef) {
+      peopleStoreRef = createPeopleStore({
+        file: path.join(MEM_DIR, "social", "people.jsonl"),
+        clip,
+        diag,
+      });
+    }
+    return peopleStoreRef;
+  }
   // ---- pre-step：注入行为记忆摘要 ----
   ctx.on(
     "agent/pre-step",
@@ -8330,6 +8344,32 @@ function apply(ctx) {
         } catch (err) {
           diag(`社交档案注入失败：${err?.message || err}`);
         }
+        // v0.45.0：他提到某个「重要的人」时，先把大致印象递上来（最多 2 人 / 300 字 / 同一人 5 轮内不重复）
+        let peopleText = "";
+        try {
+          const people = getPeopleStore();
+          if (justStarted) {
+            const swept = people.sweepIdle();
+            if (swept.length) diag("重要的人打入冷宫（久未提及）：" + swept.join("、"));
+          }
+          const hits = people.match(userTextNow || "");
+          if (hits.length) people.touch(hits.map(({ person }) => person.name)); // 提到过就算见过，避免老友被冷宫
+          if (hits.length) {
+            const seen = peopleInjected.get(sessionId) || new Map();
+            const due = hits.filter(({ person }) => {
+              const last = seen.get(person.name);
+              return last === undefined || plan.turn - last >= 5;
+            });
+            if (due.length) {
+              peopleText = people.render(due);
+              for (const { person } of due.slice(0, 2)) seen.set(person.name, plan.turn);
+              peopleInjected.set(sessionId, seen);
+              diag("熟人名片注入：" + due.slice(0, 2).map((x) => x.person.name).join("、"));
+            }
+          }
+        } catch (err) {
+          diag("熟人名片注入失败：" + (err && err.message || err));
+        }
         if (!text && !socialText && !handoffText && !recallText && !conflictText && !loreText && !circleText && !lostDetailText && !dueText && !openingText && !cueText && !nowText && !rulesForInject && !habitsForInject && !coreText && !coreStateForInject && !stateForInject && !resetNote) return decision;
         const digest = sha1(`${text}\u0000${socialText}\u0000${handoffText}\u0000${recallText}\u0000${dueText}${openingText}\u0000${cueText}\u0000${nowText}\u0000${conflictText}\u0000${loreText}\u0000${circleText}\u0000${lostDetailText}\u0000${rulesForInject}\u0000${habitsForInject}\u0000${coreText}\u0000${coreStateForInject}\u0000${stateForInject}\u0000${resetNote}`);
         // v0.44.1：注入只跟着「用户说话」走——一条新用户消息只注入一次。
@@ -8472,7 +8512,7 @@ ${selfText}
           : null;
         return {
           kind: "enter",
-          messages: [...(decision.messages || []), ...mergeInjectionMessages([...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(nowMessage ? [nowMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(sayingMessage ? [sayingMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(socialMessage ? [socialMessage] : [])])],
+          messages: [...(decision.messages || []), ...mergeInjectionMessages([...(resetMessage ? [resetMessage] : []), ...(rulesMessage ? [rulesMessage] : []), ...(coreMessage ? [coreMessage] : []), ...(coreStateMessage ? [coreStateMessage] : []), ...(selfMessage ? [selfMessage] : []), ...(stateMessage ? [stateMessage] : []), ...(handoffMessage ? [handoffMessage] : []), ...(recallMessage ? [recallMessage] : []), ...(dueMessage ? [dueMessage] : []), ...(openingMessage ? [openingMessage] : []), ...(cueMessage ? [cueMessage] : []), ...(nowMessage ? [nowMessage] : []), ...(conflictMessage ? [conflictMessage] : []), ...(loreMessage ? [loreMessage] : []), ...(sayingMessage ? [sayingMessage] : []), ...(circleMessage ? [circleMessage] : []), ...(lostDetailMessage ? [lostDetailMessage] : []), ...(text ? [injectionMessage(text)] : []), ...(peopleText ? [injectionMessage(peopleText)] : []), ...(socialMessage ? [socialMessage] : [])])],
         };
       } catch (err) {
         log("warn", `pre-step 注入失败：${err?.message || err}`);
@@ -8628,6 +8668,7 @@ ${selfText}
     // v0.45.0 按需拆开：常用工具启动即注册，长尾先排队，等 tools_switch action=on pkg=memory-tail 再展开。
     // 逃生门：环境变量 MEMORY_TOOLSET=full 时全部启动即注册（老行为）。
     const HOT_TOOLS = new Set([
+      "memory_people",
       "memory_write",
       "memory_search",
       "memory_core",
@@ -9722,6 +9763,53 @@ ${selfText}
     });
 
 
+    // v0.45.0：重要的人（20 个名额、名片 + 更宽事实预算、冷宫机制）
+    register({
+      name: "memory_people",
+      description: "重要的人：最多 20 个活跃名额，每人一张名片（≤120 字）和更宽的事实预算（800 字）。他提及时注入名片；90 天没提自动打入冷宫（关系还在，只是不再注入）。action=list 列人 | add 建/改名片 | fact 追加事实 | shelve 手动冷宫 | restore 恢复",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "list / add / fact / shelve / restore" },
+          name: { type: "string", description: "人名" },
+          card: { type: "string", description: "名片，≤120 字：称呼 · 关系 · 干什么的 · 一句性格 · 忌口/雷区" },
+          relation: { type: "string", description: "关系，≤20 字，如 大学室友" },
+          aliases: { type: "string", description: "别名，逗号分隔" },
+          text: { type: "string", description: "action=fact 用：一条属于他的事实" },
+        },
+      },
+      output,
+      async execute(args) {
+        const p = getPeopleStore();
+        const action = String(args && args.action || "list").trim();
+        const name = String(args && args.name || "").trim();
+        if (action === "list") {
+          const rows = p.all();
+          if (!rows.length) return "还没有重要的人。用 memory_people action=add name=… card=… 建一个。";
+          const act = rows.filter((r) => r.status !== "shelved");
+          const cold = rows.filter((r) => r.status === "shelved");
+          const line = (r) => "· " + r.name + (r.relation ? "（" + r.relation + "）" : "") + (r.card ? " — " + r.card : "") + "｜事实 " + ((r.facts || []).length) + " 条";
+          const head = "活跃 " + act.length + "/20";
+          const tail = cold.length ? ["冷宫 " + cold.length].concat(cold.map(line)) : [];
+          return [head].concat(act.map(line), tail).join("\n");
+        }
+        if (action === "add") {
+          if (!name) return "缺 name。";
+          const aliases = String(args && args.aliases || "").split(/[,，、]/).map((x) => x.trim()).filter(Boolean);
+          const res = p.upsert({ name, card: args && args.card, relation: args && args.relation, aliases });
+          return res.ok ? (res.created ? "已建立" : "已更新") + "重要的人：" + res.person.name + "（活跃名额 " + p.active().length + "/20）" : "没建成：" + res.error;
+        }
+        if (action === "fact") {
+          const res = p.addFact(name, args && args.text);
+          return res.ok ? "已记到「" + name + "」名下（事实 " + ((res.person.facts || []).length) + " 条）" : "没记成：" + res.error;
+        }
+        if (action === "shelve" || action === "restore") {
+          const res = action === "shelve" ? p.shelve(name) : p.restore(name);
+          return res.ok ? "已" + (action === "shelve" ? "打入冷宫" : "恢复") + "：" + name : "没成：" + res.error;
+        }
+        return "不认识的 action：" + action + "（list / add / fact / shelve / restore）";
+      },
+    });
     // v0.44.0 工具开关：list / on / off 一个入口管到底（技能开关交给 dsh-skillswitch，不重复造）。
     register({
 
