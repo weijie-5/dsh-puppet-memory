@@ -119,7 +119,7 @@ try {
   ok("镜像没有时如实报修不了", bad.ok === false, JSON.stringify(bad));
 
   // ---- 种类表 ----
-  ok("kind 表包含五类", SELF_KINDS.length === 5 && SELF_KINDS.includes("style") && SELF_KINDS.includes("habit"));
+  ok("kind 表包含六类（v0.47 加 state）", SELF_KINDS.length === 6 && SELF_KINDS.includes("style") && SELF_KINDS.includes("habit") && SELF_KINDS.includes("state"));
 } catch (err) {
   fails.push(`异常：${err?.stack || err}`);
 }

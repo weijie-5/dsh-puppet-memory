@@ -255,6 +255,12 @@ window.__ModuleLoader__.load({
       const cards = data.cards || []
       const counts = data.counts || {}
       const backup = data.backup || {}
+      // v0.47.0：用户侧切换人设提示模式；鼓励词不在这里写（由低频的「扮演总结」覆盖）
+      const setPersonaMode = async (mode) => {
+        const res = await callApi('persona-hint-set', { mode })
+        if (res && res.ok === true) setData({ ...data, personaHint: res.personaHint })
+        else setError((res && res.error) || '切换失败')
+      }
       return h('div', { className: 'pmb' },
         h('div', { className: 'pmb-title' }, '记忆'),
         h('div', { className: 'pmb-hint' }, '这台机器上的记忆现在长什么样。三张常驻卡的额度、各层条目数、压缩与备份的状态都在这儿。'),
@@ -267,6 +273,62 @@ window.__ModuleLoader__.load({
             )),
           ),
         ),
+        (() => {
+          // v0.47.0：只读展示当前用哪种人设提示；模式切换由 AI 侧决定（config.personaHint.mode）
+          const ph = data.personaHint
+          const modeRow = h(Row, { label: '切换' }, h('div', { className: 'pmb-actions' },
+            ['off', 'score', 'roleplay'].map((m) => h('button', {
+              key: m, type: 'button',
+              className: (ph && ph.mode === m) ? 'pmb-btn pmb-btn-on' : 'pmb-btn',
+              onClick: () => setPersonaMode(m),
+            }, m === 'off' ? '关闭' : m === 'score' ? '分数式' : '分数+鼓励')),
+          ))
+          const explain = h('div', { className: 'pmb-hint' },
+            '这是给「AI 说话像不像本人」加的一道提醒，跟记忆内容无关，默认关。三种选一个：',
+            h('div', null, '· 关闭：什么都不加，一轮不多一个字。'),
+            h('div', null, '· 分数式：每 25 轮给一句「人设稳定度 x/100」，便宜、够用，日常挂这个。'),
+            h('div', null, '· 分数+鼓励：在分数之外再加一句鼓励话，适合正经扮演/恋爱向；那句鼓励词要等做过「扮演总结」才有，平时不更新。'),
+            h('div', null, '切换立刻生效，不用重启；改错了点回「关闭」即可。'),
+          )
+          if (!ph || ph.mode === 'off') return h('div', { className: 'pmb-card' },
+            h('div', { className: 'pmb-title' }, '人设提示'),
+            h('div', { className: 'pmb-hint' }, '现在是关闭：不注入任何提示。'),
+            modeRow,
+            explain,
+          )
+          const label = ph.mode === 'roleplay' ? '分数 + 鼓励词' : '分数式'
+          return h('div', { className: 'pmb-card' },
+            h('div', { className: 'pmb-title' }, '人设提示'),
+            h(Row, { label: '方式' }, h('div', null, label + '（每 ' + ph.everyN + ' 轮一行）')),
+            h(Row, { label: '状态' }, h('div', null, ph.lastIntegrity === 'missing-or-clipped' ? '上次体检不完整，已重载过' : '正常（卡在场）')),
+            ph.mode === 'roleplay' ? h(Row, { label: '鼓励词' }, h('div', null, ph.hasEncourage ? '有（每次总结后覆盖）' : '还没写（默认只加分数）')) : null,
+            h(Row, { label: '切换' }, h('div', { className: 'pmb-actions' },
+              ['off', 'score', 'roleplay'].map((m) => h('button', {
+                key: m, type: 'button',
+                className: m === ph.mode ? 'pmb-btn pmb-btn-on' : 'pmb-btn',
+                onClick: () => setPersonaMode(m),
+              }, m === 'off' ? '关闭' : m === 'score' ? '分数式' : '分数+鼓励')),
+            )),
+            explain,
+          )
+        })(),
+        (function () {
+          const sp = data.sessionPool || { enabled: true, recentDays: 7 }
+          const setPool = async (enabled) => {
+            const res = await callApi('session-pool-set', { enabled })
+            if (res && res.ok === true) setData({ ...data, sessionPool: res.sessionPool })
+            else setError((res && res.error) || '保存失败')
+          }
+          return h('div', { className: 'pmb-card' },
+            h('div', { className: 'pmb-title' }, '会话候选池'),
+            h(Row, { label: '状态' }, h('div', null, sp.enabled ? '开（只收最近 ' + sp.recentDays + ' 天）' : '关（读会话不再摘候选）')),
+            h(Row, { label: '切换' }, h('div', { className: 'pmb-actions' },
+              h('button', { type: 'button', className: sp.enabled ? 'pmb-btn' : 'pmb-btn pmb-btn-on', onClick: () => setPool(false) }, '关'),
+              h('button', { type: 'button', className: sp.enabled ? 'pmb-btn pmb-btn-on' : 'pmb-btn', onClick: () => setPool(true) }, '开'),
+            )),
+            h('div', { className: 'pmb-hint' }, '读会话时顺手摘出的候选，攒着等确认；关掉只是不再摘，已有的不会删。'),
+          )
+        })(),
         h('div', { className: 'pmb-card' },
           h('div', { className: 'pmb-title' }, '条目'),
           h('div', { className: 'pmb-grid' },

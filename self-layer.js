@@ -17,7 +17,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-export const SELF_KINDS = ["style", "habit", "fact", "lesson", "other"];
+// v0.48：新增 state —— 状态卡（主线/待办/已发）并入自我层存储，但注入节奏仍按状态卡走
+export const SELF_KINDS = ["style", "habit", "fact", "lesson", "state", "other"];
 
 export const selfDefaults = {
   enabled: true,
