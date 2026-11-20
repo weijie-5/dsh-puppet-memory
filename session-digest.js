@@ -11,8 +11,24 @@ export const RULES = [
 ];
 
 const NOISE = /^(好的|嗯+|哦+|行|收到|可以|哈+|草|草了|？+|！+|…+|\.{3,})$/;
+// 脱离上下文就说不通的句子：带这层指代的一律不收（2026-11-20 依 49 条被判死的候选得出）
+const CONTEXTUAL = /(给你|跟你说|跟你说啊|跟你说过|这个|那个|这些|那些|这样|那样|刚才|等下|上面|下面|一下|要不要|你觉得|你说)/;
+// 一次性操作（只在那一场成立）：带即时态词的不进池
+const LOCAL = /(上一条|上一句|发过去|发错了|还没|明天|今天|这次|先记住|等一下|稍后|刚发|已经发)/;
 // 工作文档痕迹：markdown 标记、列表符号、代码/路径格式——这类是工作内容，不该进记忆
 const MD_JUNK = /(\*\*|__|^[-*•]\s|^\d+\.\s|^#{1,6}\s|\||```|`[^`]+`|^>\s|AGENTS\.md)/;
+
+// 单句判定：收不收、算什么 kind。抽出来是为了能拿历史候选做回归测试。
+export function classifySentence(s) {
+  const t = String(s || "").trim();
+  if (t.length < 8 || t.length > 80) return null;
+  if (NOISE.test(t)) return null;
+  if (MD_JUNK.test(t)) return null;
+  if (CONTEXTUAL.test(t)) return null;
+  if (LOCAL.test(t)) return null;
+  const hit = RULES.find((r) => r.re.test(t));
+  return hit ? { kind: hit.kind, text: t } : null;
+}
 
 export function pickCandidates(turns, { minLen = 8, maxLen = 80, max = 40 } = {}) {
   const out = [];
@@ -24,12 +40,12 @@ export function pickCandidates(turns, { minLen = 8, maxLen = 80, max = 40 } = {}
       if (s.length < minLen || s.length > maxLen) continue;
       if (NOISE.test(s)) continue;
       if (MD_JUNK.test(s)) continue;
-      const hit = RULES.find((r) => r.re.test(s));
+      const hit = classifySentence(s);
       if (!hit) continue;
       const key = s.replace(/\s+/g, "").slice(0, 14);
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ kind: hit.kind, text: s });
+      out.push(hit);
       if (out.length >= max) return out;
     }
   }

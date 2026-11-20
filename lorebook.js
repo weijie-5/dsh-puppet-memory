@@ -1,10 +1,12 @@
-// lorebook.js — 世界书 / 书签（v1.0 / 2026-11-15）
+// lorebook.js — 世界书 / 书签（v1.0 / 2026-11-15；2026-11-20 重定位为「约定书签」）
+// 2026-11-20 丹阳：「世界书的原功能比较拉胯，干脆不用了，专门用来记约定，它本来就是一个在整个记忆标记的小书签。」
 //
 // 丹阳 2026-11-15 的比喻：像小说软件的世界书，专门放"额外记录"的东西，像书里的书签。
 //
 // 规则：
 //   · 一条 = {名字, 关键词[], 内容, 优先级, 常驻?}；**关键词命中才进上下文**，不命中的一条不带；
-//   · **它不是规则**：只补背景与名词解释，模型不能据此改行为（注入块里写死这句）；
+//   · **它是约定书签，不是规则册**：挂的就是「跨会话要守的那些约定/口径」，命中就把那条提醒出来；
+//     规则册仍是唯一源（R 编号），书签不能覆盖它，只负责在需要的时候把话说到；
 //   · **零模型成本**：纯字符串匹配；命中按优先级 + 命中词数排序，超出预算截断；
 //   · 存储：deep/lorebook.jsonl（追加式，删条目走 enabled=false 或物理删）。
 
@@ -69,7 +71,9 @@ export function createLorebook({ dir } = {}) {
     return out.slice(0, 12);
   }
 
-  function add({ name, keywords, content, priority, always } = {}) {
+  // 2026-11-20 丹阳定：条目是「主 = 一个事件，次 = 要触发的约定内容 + 状态」。
+  // 同一事件只有一个条目（name 就是事件名），状态变了用 update 改 state，不新开一条。
+  function add({ name, keywords, content, priority, always, state, stateAt } = {}) {
     const n = String(name || "").trim();
     const c = String(content || "").trim();
     if (!n) return { ok: false, error: "name 必填（这条书签叫什么）" };
@@ -95,12 +99,16 @@ export function createLorebook({ dir } = {}) {
       enabled: true,
       ts: new Date().toISOString(),
     };
+    if (state !== undefined && String(state).trim()) {
+      row.state = String(state).trim();
+      row.stateAt = String(stateAt || "").trim() || new Date().toISOString().slice(0, 10);
+    }
     list.push(row);
     writeJsonl(files.lore, list);
     return { ok: true, row };
   }
 
-  function update({ id, name, keywords, content, priority, always, enabled } = {}) {
+  function update({ id, name, keywords, content, priority, always, enabled, state, stateAt } = {}) {
     const key = String(id || "").trim();
     const list = rows();
     const i = list.findIndex((r) => r.id === key || r.id.startsWith(key));
@@ -110,6 +118,16 @@ export function createLorebook({ dir } = {}) {
     if (keywords !== undefined) r.keywords = normKeywords(keywords);
     if (content !== undefined) r.content = String(content).trim() || r.content;
     if (priority !== undefined) r.priority = Math.max(0, Math.min(100, Number(priority) || 0));
+    if (state !== undefined) {
+      const v = String(state).trim();
+      if (v) {
+        r.state = v;
+        r.stateAt = String(stateAt || "").trim() || new Date().toISOString().slice(0, 10);
+      } else {
+        delete r.state;
+        delete r.stateAt;
+      }
+    }
     if (always !== undefined) r.always = Boolean(always);
     if (enabled !== undefined) r.enabled = Boolean(enabled);
     r.updatedAt = new Date().toISOString();
@@ -163,14 +181,54 @@ export function createLorebook({ dir } = {}) {
 
   function render(picked) {
     if (!picked || !picked.length) return "";
-    const lines = picked.map((h) => `- 「${h.r.name}」${h.r.content}`);
+    const lines = picked.map((h) => {
+      const st = h.r.state ? `｜状态：${h.r.state}${h.r.stateAt ? `（${h.r.stateAt}）` : ""}` : "";
+      return `- 「${h.r.name}」${h.r.content}${st}`;
+    });
     return [
       "<puppet_lore>",
-      "世界书（书签）：关键词命中时补的背景资料。**这不是规则**——只用来把名词、设定、前情说准，不改变行为准则。",
+      "约定书签（世界书）：下面是你和他之间挂在这个话题上的约定，命中就按它来。它**不是规则册**（规则册 R 编号才是唯一源），但也不是背景资料——是要照做的口径。带「状态」的条目是事件当前值：这一轮如果说的和状态不一样，先说一句「书签里是 X」，别顺着错的说。",
       ...lines,
       "</puppet_lore>",
     ].join("\n");
   }
 
-  return { files, add, update, remove, list, pick, render, normKeywords };
+  // 相似判定（2026-11-20 丹阳：「同一个约定只能存在一个」）：词法 bigram Jaccard，零模型。
+  function bigrams(s) {
+    const t = String(s || "").replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, "");
+    const out = new Set();
+    for (let i = 0; i + 1 < t.length; i++) out.add(t.slice(i, i + 2));
+    return out;
+  }
+  function similarity(a, b) {
+    const A = bigrams(a);
+    const B = bigrams(b);
+    if (!A.size || !B.size) return 0;
+    let inter = 0;
+    for (const x of A) if (B.has(x)) inter += 1;
+    return inter / (A.size + B.size - inter);
+  }
+  // 4 字片段命中：改个词序、换个说法也能认出来（Jaccard 对短句+长句太苛刻，实测 0.23 漏判）
+  function contained(a, b) {
+    const A = String(a || "").replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, "");
+    const B = String(b || "").replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, "");
+    if (A.length < 4 || B.length < 4) return false;
+    for (let i = 0; i + 4 <= A.length; i += 1) {
+      if (B.includes(A.slice(i, i + 4))) return true;
+    }
+    return false;
+  }
+  /** 找最像的已有约定。命中返回 { row, score }，否则 null。 */
+  function findSimilar(text, { min = 0.5, includeDisabled = true } = {}) {
+    let best = null;
+    for (const r of list({ includeDisabled })) {
+      const hay = String(r.name || "") + " " + String(r.content || "") + " " + String(r.state || "");
+      let s = similarity(text, hay);
+      if (contained(text, hay)) s = Math.max(s, 0.6);
+      if (s >= min && (!best || s > best.score)) best = { row: r, score: s };
+    }
+    return best;
+  }
+
+  return { files, add, update, remove, list, pick, render, normKeywords, findSimilar, similarity };
 }

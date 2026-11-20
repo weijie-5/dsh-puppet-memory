@@ -42,6 +42,9 @@ import { integrityScore, normalizePersonaHint, personaHintLine, tickScore } from
 import { harvestCandidates, harvestTodo } from "./self-promote.js";
 import { pickCandidates } from "./session-digest.js";
 import { appendCandidates } from "./session-pool.js";
+import { judgePending as judgePoolPending } from "./session-pool-judge.js";
+import { scanTurn as scanAgreements, summarize as summarizeAgreements, collectKnown as collectKnownAgreements, collectRejected as collectRejectedAgreements, collectNonWork as collectNonWorkTurns, renderInbox, classifyTurn, promote as promoteAgreement, absurdHint, dangerHint, parseWhen } from "./agreement-watch.js";
+import { judgeInbox as judgeAgreementInbox } from "./agreement-judge.js";
 import { readKnowledge } from "./knowledge.js";
 import { createSessionMemory, isSpecialKey, normalizeSessionId, sessionMemoryPaths } from "./sessionmem.js";
 import { createLearn, coreLock, checkAbsurd } from "./learn.js";
@@ -113,6 +116,8 @@ const PATHS = {
   guide: path.join(MEM_DIR, "deep", "guide.jsonl"),
   // 压缩记录（v0.18）：只从官方 compaction/* 会话事件里取，一次压缩一行。
   compactionLog: path.join(MEM_DIR, "deep", "compaction-log.jsonl"),
+  // v0.49.0：约定书签巡检记录（每轮原文落盘后扫一次，零模型）
+  agreementLog: path.join(MEM_DIR, "deep", "agreement-log.jsonl"),
   // 三期（v0.17）：从自动摘要提炼出来的「待确认事实」。这里只放候选，绝不被注入、不算记忆
   factCandidates: path.join(MEM_DIR, "deep", "fact-candidates.jsonl"),
   array: path.join(MEM_DIR, "array"),
@@ -829,6 +834,11 @@ function loadConfig() {
   const merged = { ...defaultConfig(), ...cfg };
   merged.inject = { ...defaultConfig().inject, ...(cfg.inject || {}) };
   merged.inject.core = { ...defaultConfig().inject.core, ...((cfg.inject && cfg.inject.core) || {}) };
+  // 2026-11-20 丹阳：「这个让 ai 改就行，只要保证下次更新不覆盖」——
+  // 用户常常只写 state.maxChars 不写 state.enabled，浅合并会把 enabled 丢掉（=状态卡悄悄不注入）。
+  // 这两层单独深合并，只改一个字也得安全。
+  merged.inject.core.state = { ...defaultConfig().inject.core.state, ...((((cfg.inject || {}).core || {}).state) || {}) };
+  merged.inject.core.rules = { ...defaultConfig().inject.core.rules, ...((((cfg.inject || {}).core || {}).rules) || {}) };
   merged.self = { ...defaultConfig().self, ...(cfg.self || {}) };
   merged.self.inject = { ...defaultConfig().self.inject, ...((cfg.self && cfg.self.inject) || {}) };
   merged.self.audit = { ...defaultConfig().self.audit, ...((cfg.self && cfg.self.audit) || {}) };
@@ -1632,18 +1642,11 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now(), collect } = {
     shown = picked.slice(0, 3);
     weak = [];
   }
-  // v1.0（2026-11-15）：标题卡模式（rec.titleCard=false 可退回旧版整句摘要）
-  const titleCard = rec.titleCard !== false;
+  // 2026-11-20：退回见正文——只给标题/标签等于没给，模型看到标签就当看过了，转头还是忘
   const lineOf = (h) => {
     const why = h.matched && h.matched.length ? `（命中：${h.matched.slice(0, 3).join("、")}）` : "";
-    if (!titleCard) return `· [${h.layer}] ${h.brief}${h.hash ? ` #${h.hash}` : ""}${why}`;
-    const tags = h.tags && h.tags.length ? `〔${h.tags.join("·")}〕` : "";
-    const mark = h.mark || "";
-    // R2（2026-11-19）：标题之外再给一句摘要——只给标题等于"白提示"（命中却不知道内容）
-    const title = clip(h.title || h.brief, 22);
-    const digest = clip(String(h.brief || "").replace(/\s+/g, " ").trim(), 26);
-    const extra = digest && !String(title).includes(digest.slice(0, 8)) ? `｜${digest}` : "";
-    return `· [${h.layer}] ${mark}${title}${tags}${extra}${h.hash ? ` #${h.hash}` : ""}${why}`;
+    const prose = String(h.brief || "").replace(/\s+/g, " ").trim();
+    return `· [${h.layer}] ${prose}${h.hash ? ` #${h.hash}` : ""}${why}`;
   };
   const head = shown.length === picked.length
     ? "以下是按你这句话里的关键词顺手取回的几条记忆（不是全部；要细节用 memory_search）："
@@ -1656,7 +1659,11 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now(), collect } = {
       const keys = [k.term, ...(k.aliases || [])].map((x) => String(x || "").toLowerCase()).filter(Boolean);
       if (!keys.some((x) => text.includes(x))) continue;
       const where = k.library ? "（全文：库 " + k.library + (k.doc ? " / 文档 " + k.doc : "") + "）" : "";
-      knowLines.push("· [知识] " + String(k.term) + "｜" + clip(String(k.conclusion || ""), 40) + where);
+      // 2026-11-20：知识结论实测 70–206 字，40 字把一半都截掉了；提到 200 让结论整句落地
+      // 超过 300 的不硬塞——压到 200 并标出来，建议放到别的插件（库/文档）去
+      const concl = String(k.conclusion || "");
+      const overNote = concl.length > 300 ? `〔原文 ${concl.length} 字·建议外置到别的插件〕` : "";
+      knowLines.push("· [知识] " + String(k.term) + "｜" + clip(concl, 200) + overNote + where);
       if (knowLines.length >= 2) break;
     }
   } catch (err) {
@@ -1677,9 +1684,7 @@ function buildRecallInjection(cfg, userText, { nowMs = Date.now(), collect } = {
   const recallBlock = [
     "<puppet_recall>",
     head,
-    rec.titleCard === false
-      ? "（若其中某条与当前话题相关，用 memory_search 取细节，不要凭摘录猜；没命中就换更短的词再查一次。）"
-      : "（标题卡只给标题/标签/id，正文没带进来；需要细节就 memory_search 或 memory_locate 取原文。）",
+    "（上面是原话摘要；要完整内容用 memory_search 或 memory_locate 取原文，别凭摘要猜。）",
     ...body,
     "</puppet_recall>",
   ].join("\n");
@@ -2119,8 +2124,9 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
   // 日记：重要事件（important:true）优先占位，再用最近日记补齐，最多 4 条
   // v1.5（2026-11-17 丹阳）：日记本身≈压缩过的上下文，压缩后不再补它——补了是重复
   const diaryFiles = opts.skipDiary || !want("diary") ? [] : dirJsonl(PATHS.diaryDir);
-  const recentDiaries = (diaryFiles.length ? tailJsonl(diaryFiles[diaryFiles.length - 1], 40) : []).filter(
-    (d) => !suppressed.has(String(d?.hash || "")) && !d?.voided,
+  // 2026-11-20：日记层里 turn 占 98.6%，注入「最近日记」时不能把"刚才说过的话"当日记再喂一遍
+  const recentDiaries = (diaryFiles.length ? tailJsonl(diaryFiles[diaryFiles.length - 1], 200) : []).filter(
+    (d) => !suppressed.has(String(d?.hash || "")) && !d?.voided && String(d?.kind || "") !== "turn",
   );
   const pickedDiaries = [];
   for (let i = recentDiaries.length - 1; i >= 0 && pickedDiaries.length < 2; i -= 1) {
@@ -2141,17 +2147,29 @@ function buildInjectionText(cfg, coreUsed = 0, lines = null, opts = {}) {
     parts.push(`【最近日记】${clip(line, 420)}`);
   }
 
-  // v0.43.1：「没启用的工具只发简要说明」——一句话清单，省掉整套 schema 的钱，
-  // 模型知道有什么可开，需要时说一句再去开（开完要重启，这点如实说）。
+  // v0.49.0：非工作原文（压缩后归档）还有没整理的，提一句指路——我只读那个文件，不翻会话原文。
   try {
-    const mp = path.join(os.homedir(), ".dsh", "tools-manifest.json");
-    const man = JSON.parse(fs.readFileSync(mp, "utf8"));
-    if (Array.isArray(man.off) && man.off.length) {
-      parts.push(`【未启用工具】${man.off.join("；")}（要用先开插件并重启，别假装能用）`);
+    const txt = fs.readFileSync(path.join(MEM_DIR, "deep", "agreement-inbox.md"), "utf8");
+    const n = (txt.match(/\n\- /g) || []).length;
+    // 2026-11-20 丹阳：「约定待整理 也可以删了」——小模型能整理时这条对我没用，只占上下文。
+    // 改成异常兜底：积压到 20 条（正常在压缩后就被小模型清掉了）才提醒我接手。
+    if (n >= 20) parts.push(`【约定积压】活日记积到 ${n} 条没整理——小模型引擎大概没跑，我手动读 deep/agreement-inbox.md 整理成书签（主=事件，次=约定+状态），处理完的句子挪进 agreement-inbox-done.md`);
+  } catch {
+    /* 没有归档就不提 */
+  }
+
+  // v0.49.0（2026-11-20）：约定书签巡检反馈——最近 30 分钟内有记录才提一句，平时不占上下文。
+  try {
+    const rows = readJsonl(PATHS.agreementLog).slice(-3);
+    const recent = rows.filter((r) => Date.now() - Date.parse(String(r.ts || "")) < 30 * 60 * 1000);
+    if (recent.length) {
+      const line = recent.map((r) => String(r.summary || "").slice(0, 120)).filter(Boolean).join("；");
+      if (line) parts.push(`【约定巡检】${clip(line, 220)}`);
     }
   } catch {
-    /* 没有清单就不提 */
+    /* 没记录就不提 */
   }
+
 
   if (!parts.length) return "";
 
@@ -3423,10 +3441,211 @@ function readCompactionLog() {
   return readJsonl(PATHS.compactionLog);
 }
 
+// 候选池二次判定（v0.49.0）：本地小模型在跑就立刻判一批；没在跑就什么都不改，压缩后再试。
+// fail-open：判不了就不动数据，绝不因为模型不可用误杀候选。
+function spawnPoolJudge(reason) {
+  try {
+    const cfg = loadConfig();
+    const j = (cfg.sessionPool && cfg.sessionPool.judge) || {};
+    const endpoint = String(j.endpoint || (cfg.conflict && cfg.conflict.endpoint) || "").trim();
+    if (!endpoint) return;
+    const model = j.model || (cfg.conflict && cfg.conflict.model) || "";
+    void judgePoolPending(path.join(MEM_DIR, "deep", "session-candidates.jsonl"), { ...j, endpoint, model })
+      .then((r) => { if (r && (r.judged || r.note)) diag(`候选池判定（${reason}）：判 ${r.judged} 条、丢 ${r.dropped} 条｜${r.note || "ok"}`); })
+      .catch(() => { /* 判不了就当没发生 */ });
+  } catch {
+    /* 配置读不到也不影响主流程 */
+  }
+}
+
+// 非工作原文归档（2026-11-20 丹阳）：平时只攒在本会话内存里，**压缩后**才写进 deep/agreement-inbox.md，
+// 我整理时只读那个文件，不翻会话原文（翻原文要吃掉大量上下文）。
+const inboxPending = new Map(); // sessionId -> [{ at, text }]
+
+function queueNonWork(sessionId, userText, tools = []) {
+  // 调过工具/技能就是工作（愉悦工具除外）——工作轮不进活日记。
+  if (classifyTurn(tools) !== "leisure") return;
+  const rows = inboxPending.get(sessionId) || [];
+  for (const text of collectNonWorkTurns(userText)) {
+    if (!rows.some((r) => r.text === text)) rows.push({ at: new Date().toISOString(), text });
+  }
+  if (rows.length) inboxPending.set(sessionId, rows.slice(-80));
+}
+
+function flushAgreementInbox(sessionId) {
+  const key = String(sessionId || "");
+  const rows = inboxPending.get(key) || [];
+  if (!rows.length) return { ok: true, flushed: 0 };
+  const file = path.join(MEM_DIR, "deep", "agreement-inbox.md");
+  let head = "";
+  try { head = fs.readFileSync(file, "utf8"); } catch { head = renderInbox([]) + "\n"; }
+  // 去掉旧标题，只续内容，避免每次压缩都堆一层标题
+  const body = head.replace(/^# 非工作原文[^\n]*\n+/, "").trimEnd();
+  const add = rows.map((r) => "- " + r.text).join("\n");
+  const next = "# 非工作原文 · 活日记（压缩后归档；整理出的约定进书签，原文留在这里）\n\n" + body + "\n" + add + "\n";
+  fs.writeFileSync(file, next, "utf8");
+  inboxPending.delete(key);
+  diag(`非工作原文归档：${rows.length} 条 → deep/agreement-inbox.md`);
+  return { ok: true, flushed: rows.length, file };
+}
+
+// ---- 活日记整理（2026-11-20 丹阳：「约定待整理 有小模型用小模型处理，没有才是你」）----
+// 小模型判「是不是要长期照做的约定」：通过 → 书签（主=事件，次=内容+状态）；判否 → 黑名单。
+// 判完的句子挪进 agreement-inbox-done.md，inbox 只留没处理的；引擎不可用就整批留着，等我手动。
+const inboxFile = () => path.join(MEM_DIR, "deep", "agreement-inbox.md");
+const inboxDoneFile = () => path.join(MEM_DIR, "deep", "agreement-inbox-done.md");
+
+function readInboxRows() {
+  let txt = "";
+  try { txt = fs.readFileSync(inboxFile(), "utf8"); } catch { return []; }
+  return txt
+    .split(/\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("- "))
+    .map((l) => l.slice(2).trim())
+    .filter(Boolean);
+}
+
+function writeInboxRows(rows) {
+  const head = "# 非工作原文 · 活日记（压缩后归档；整理出的约定进书签，原文留在这里）\n\n";
+  fs.writeFileSync(inboxFile(), head + rows.map((t) => "- " + t).join("\n") + (rows.length ? "\n" : ""), "utf8");
+}
+
+function appendInboxDone(rows) {
+  if (!rows.length) return;
+  let old = "";
+  try { old = fs.readFileSync(inboxDoneFile(), "utf8"); } catch { old = "# 已整理的活日记（判定完的原文留档，不进注入）\n\n"; }
+  fs.writeFileSync(inboxDoneFile(), old.trimEnd() + "\n" + rows.map((t) => "- " + t).join("\n") + "\n", "utf8");
+}
+
+function spawnAgreementJudge(reason) {
+  try {
+    const cfg = loadConfig();
+    const j = (cfg.sessionPool && cfg.sessionPool.judge) || {};
+    const endpoint = String(j.endpoint || (cfg.conflict && cfg.conflict.endpoint) || "").trim();
+    const rows = readInboxRows();
+    if (!rows.length) return;
+    if (!endpoint) {
+      diag(`活日记整理（${reason}）：没配本地端点，${rows.length} 条留着等我手动整理`);
+      return;
+    }
+    const model = j.model || (cfg.conflict && cfg.conflict.model) || "";
+    void judgeAgreementInbox(rows.map((t) => ({ text: t })), { ...j, endpoint, model })
+      .then((r) => {
+        if (!r || !r.available || !r.verdicts.length) {
+          diag(`活日记整理（${reason}）：${(r && r.note) || "无结果"}，${rows.length} 条留着`);
+          return;
+        }
+        const doneRows = [];
+        let kept = 0;
+        let dropped = 0;
+        let turned = 0;
+        for (const v of r.verdicts) {
+          const text = String(v.text || "").trim();
+          if (!text) continue;
+          if (v.keep) {
+            // 双保险：小模型说「算约定」也要过本地两道线——毒物/荒谬剂量绝不落成书签
+            // （2026-11-20 丹阳测出「明天十二点吃老鼠药」，本地漏判过一次，不能只靠模型）
+            const hardWhy = dangerHint(text) || absurdHint(text);
+            if (hardWhy) {
+              if (rejectAgreement(text, (dangerHint(text) ? "危险：" : "荒诞：") + hardWhy)) dropped += 1;
+              doneRows.push(text);
+              continue;
+            }
+            // 带时间的约定 → 开幕表（丹阳：「带时间约定的可以转交给开幕表提醒」）
+            // 幕表登记完，书签再记一条索引并**立即标废**——不占 30 条名额，但能从幕表查回原文
+            const when = v.kind === "event" ? parseWhen(v.state || text) : null;
+            if (when) {
+              const label = String(v.event || text).slice(0, 20);
+              const op = addOpeningRow({
+                date: when.date,
+                label,
+                note: [String(v.content || text).slice(0, 120), String(v.state || "").slice(0, 40)].filter(Boolean).join("｜"),
+                source: "约定书签·自动转",
+                once: true,
+              });
+              const res2 = promoteAgreement(loreLayer(), {
+                name: "〔幕表〕" + label,
+                content: v.content || text,
+                state: when.at,
+                stateAt: when.date,
+              });
+              const newId = res2?.row?.id || res2?.id;
+              if (res2 && res2.ok && newId) loreLayer().update({ id: newId, enabled: false });
+              if (op && op.ok) turned += 1;
+              doneRows.push(text);
+              continue;
+            }
+            const res = promoteAgreement(loreLayer(), {
+              name: v.event || text.slice(0, 10),
+              content: v.content || text,
+              state: v.state || "",
+              stateAt: v.state ? new Date().toISOString().slice(0, 10) : "",
+            });
+            if (res && res.ok) kept += 1;
+            else diag(`活日记整理：书签没落成（${res && res.error}）：${text.slice(0, 20)}`);
+          } else {
+            const why = v.absurd ? "荒诞：" + (v.why || "小模型判定") : "小模型判定不是约定" + (v.why ? "：" + v.why : "");
+            if (rejectAgreement(text, why)) dropped += 1;
+          }
+          doneRows.push(text);
+        }
+        const rest = readInboxRows().filter((t) => !doneRows.includes(t));
+        writeInboxRows(rest);
+        appendInboxDone(doneRows);
+        diag(`活日记整理（${reason}）：记书签 ${kept} 条、转幕表 ${turned} 条、进黑名单 ${dropped} 条、剩 ${rest.length} 条`);
+      })
+      .catch(() => { /* 判不了就整批留着 */ });
+  } catch {
+    /* 配置读不到不影响主流程 */
+  }
+}
+
+// 约定黑名单（2026-11-20）：规则册/核心卡/常言/习惯里已有的，不再进书签。30 秒缓存，避免每轮读一堆小文件。
+let knownAgreeCache = { at: 0, rows: [] };
+function knownForAgreement() {
+  if (knownAgreeCache.rows.length && Date.now() - knownAgreeCache.at < 30000) return knownAgreeCache.rows;
+  try {
+    knownAgreeCache = { at: Date.now(), rows: collectKnownAgreements(MEM_DIR) };
+  } catch {
+    knownAgreeCache = { at: Date.now(), rows: [] };
+  }
+  return knownAgreeCache.rows;
+}
+
+// 约定黑名单（2026-11-20 丹阳：「不对的你黑名单，下次就不会触发了」）：
+// 被荒诞线或小模型否掉的候选，一句一条存下来，下次同句/近句直接跳过，不再进候选。
+let rejectedAgreeCache = { at: 0, rows: [] };
+function rejectedForAgreement() {
+  if (rejectedAgreeCache.rows.length && Date.now() - rejectedAgreeCache.at < 30000) return rejectedAgreeCache.rows;
+  try {
+    rejectedAgreeCache = { at: Date.now(), rows: collectRejectedAgreements(MEM_DIR) };
+  } catch {
+    rejectedAgreeCache = { at: Date.now(), rows: [] };
+  }
+  return rejectedAgreeCache.rows;
+}
+
+/** 把一条被否的候选记进黑名单（去重；同句不再重复写）。 */
+function rejectAgreement(text, reason) {
+  const t = String(text || "").trim();
+  if (t.length < 4) return false;
+  const rows = collectRejectedAgreements(MEM_DIR);
+  if (rows.some((r) => r === t)) return false;
+  appendJsonl(path.join(MEM_DIR, "deep", "agreement-rejected.jsonl"), {
+    text: t,
+    reason: String(reason || ""),
+    ts: new Date().toISOString(),
+  });
+  rejectedAgreeCache = { at: Date.now(), rows: [...rows, t] };
+  return true;
+}
+
 function appendCompactionRecord(record) {
   appendJsonl(PATHS.compactionLog, record);
   const rows = readJsonl(PATHS.compactionLog);
   if (rows.length > COMPACTION_LOG_KEEP) writeJsonl(PATHS.compactionLog, rows.slice(-COMPACTION_LOG_KEEP));
+  spawnPoolJudge("压缩后");
   return record;
 }
 
@@ -3526,6 +3745,10 @@ function ingestCompactionEvent(ev, sessionId) {
     outputTokens: Number(summary.usage?.outputTokens) || 0,
   };
   appendCompactionRecord(record);
+  // v0.49.0：压缩后归档本会话的「非工作原文」，我整理约定书签时只读这个文件。
+  try { flushAgreementInbox(record.session); } catch (err) { diag("非工作归档失败：" + (err?.message || err)); }
+  // v0.49.0：压缩后让本地小模型整理活日记（引擎不在就留着，等我手动）
+  try { spawnAgreementJudge("压缩后"); } catch (err) { diag("活日记整理失败：" + (err?.message || err)); }
   return { ok: true, recorded: true, record };
 }
 
@@ -3587,6 +3810,8 @@ function searchTargets(layer) {
   const deep = [PATHS.sayings, PATHS.guide, PATHS.opening, ...dirJsonl(PATHS.treeDir)];
   const array = [...arrayIndexFiles(), PATHS.sessionsIndex];
   if (layer === "behavior") return behavior;
+  // 2026-11-20：diary 层只给真日记；对话流水（turn）在扫描循环里被 diaryOnly 排掉
+  if (layer === "diary") return [...dirJsonl(PATHS.diaryDir)];
   if (layer === "deep") return deep;
   if (layer === "array") return array;
   if (layer === "user") return [PATHS.user];
@@ -3693,7 +3918,7 @@ function searchSocialContext(social, args = {}) {
 
 // v0.34（B-52）：要点层——从一条记忆里压出一句能扫读的话（抽取式，不调模型、零成本）。
 // 只取第一句、去掉标记和层前缀、超长截断；原文仍在，要点只是索引。
-const BRIEF_MAX_CHARS = 60;
+const BRIEF_MAX_CHARS = 200;
 // v0.43.1（2026-11-17 评测发现）：命中渲染只给正文，绝不把整行 JSONL 贴进上下文。
 // 背景：renderHit / 按层列举以前直接用 doc.line（整行 JSON），88 道评测题里 85 道
 // 都带着 {"kind":"note","ts":...} 这种噪声进上下文——白占预算，还不带信息。
@@ -4419,7 +4644,9 @@ function formatSearchHit(doc, srcIdx) {
   }
   const hs = entry?.hash ? `  #${entry.hash}` : "";
   const provenance = entryProvenance(entry, srcIdx);
-  const voidMark = entry?.voided ? `〔已标废：${clip(String(entry.voided.reason || ""), 40)}〕` : "";
+  // 2026-11-20：替换链显示——标废时若记了 supersededBy，旧条能一路追到新条
+  const supMark = entry?.voided && entry.voided.supersededBy ? ` → 被 #${String(entry.voided.supersededBy).slice(0, 8)} 取代` : "";
+  const voidMark = entry?.voided ? `〔已标废：${clip(String(entry.voided.reason || ""), 40)}${supMark}〕` : "";
   // v0.37（B-74）：已结束的条目照样能查回，但必须标出来——「真但过期」不是「假的」
   const endedMark = doc.ended ? `〔已结束：${clip(String(doc.ended.reason || ""), 30)}${doc.ended.at ? ` · ${String(doc.ended.at).slice(0, 10)}` : ""}〕` : "";
   return `${where}:${doc.lineNo}  ${endedMark}${voidMark}${statePrefixOf(entry)}${clip(displayTextOf(entry), 300)}${hs}${suffix}${provenance ? `  ${provenance}` : ""}`;
@@ -4462,7 +4689,7 @@ function learnLayer() {
 }
 
 // 冲突核对（v1.0，2026-11-15）：广取候选 + 小模型判读，只查"当前说法 vs 旧记忆"的事实矛盾。
-// 世界书 / 书签（v1.0，2026-11-15）：关键词命中才注入的背景条目
+// 世界书 / 书签（v1.0，2026-11-15；2026-11-20 重定位）：**约定书签**——关键词命中才注入的约定条目
 let loreSingleton = null;
 function loreLayer() {
   if (!loreSingleton) loreSingleton = createLorebook({ dir: MEM_DIR });
@@ -4495,7 +4722,7 @@ function conflictLayer() {
   return conflictSingleton;
 }
 
-const SEARCH_LAYERS = ["behavior", "deep", "array", "user", "memo"];
+const SEARCH_LAYERS = ["behavior", "diary", "deep", "array", "user", "memo"];
 const SEARCH_STATUS = ["done", "failed", "heard"];
 
 /** 解析 YYYY-MM-DD / ISO 成毫秒；endOfDay=true 时补到当天 23:59:59.999（本机时区） */
@@ -4590,11 +4817,13 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     }
     return "缺少 query 或 tag 参数；layer=memo 或 layer=user 时可不传，直接列出该层";
   }
+  const diaryOnly =
+    layerList.includes("diary") && !layerList.includes("behavior") && !layerList.includes("all");
   const allowed = new Set();
   for (const one of layerList) for (const file of searchTargets(one)) allowed.add(file);
   // v0.36（A-79）：日记按月预筛——只扫「guide 里有候选关键词」的月份
   const diaryPre =
-    layerList.some((l) => l === "behavior" || l === "all")
+    layerList.some((l) => l === "behavior" || l === "diary" || l === "all")
       ? diaryFilesWithCandidates(tokens)
       : null;
 
@@ -4663,6 +4892,8 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     const entry = doc.entry;
     // v0.35（B-55）：标废条目默认不进检索结果
     if (entry?.voided && !includeVoided) continue;
+    // 2026-11-20：layer=diary 只给真日记，turn 不进
+    if (diaryOnly && String(entry?.kind || "") === "turn") continue;
     // v0.37（B-76③）：三态 / 时间窗 / kind 过滤（先过滤再算分，省算力也让计数准确）
     if (statusFilter && String(entry?.state || "") !== statusFilter) continue;
     if (sinceMs !== null && !(Number(doc.ts) >= sinceMs)) continue;
@@ -4670,7 +4901,11 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     if (kindFilter) {
       const kindOfEntry = String(entry?.kind || "");
       const fileIsDiary = rel(doc.file).startsWith("behavior/diary/");
-      const kindHit = kindFilter === "diary" ? fileIsDiary || kindOfEntry === "diary" : kindOfEntry === kindFilter;
+      // 2026-11-20：kind=diary 只找真日记——turn 是对话流水，不算日记
+      const kindHit =
+        kindFilter === "diary"
+          ? (fileIsDiary || kindOfEntry === "diary") && kindOfEntry !== "turn"
+          : kindOfEntry === kindFilter;
       if (!kindHit) continue;
     }
     let tagHit = true;
@@ -4786,13 +5021,49 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
     return `没有找到带标签「${tagQuery}」的记忆。`;
   }
   const srcIdx = sourceIndex();
+  // 2026-11-20：区分「回忆」和「转头忘事」——
+  // 同一会话里、最近一次压缩之后产生的 turn，此刻还在上下文里；
+  // 搜到它不等于「想起了」，只是「刚才说过」。只标注，不改变召回。
+  // 会话 id 有两种写法（带 session- 前缀 / 裸 uuid），两边都归一化再比，否则永远匹配不上
+  const normSid = (s) => String(s || "").trim().replace(/^session[-_]/, "");
+  const ctxSession = normSid(opts.contextSession);
+  let ctxCutoffMs = 0;
+  if (ctxSession) {
+    try {
+      const rows = readCompactionLog().filter((r) => normSid(r && r.session) === ctxSession);
+      const lastAt = rows.length ? String(rows[rows.length - 1] && rows[rows.length - 1].at || "") : "";
+      if (lastAt) ctxCutoffMs = Date.parse(lastAt) || 0;
+    } catch {
+      ctxCutoffMs = 0;
+    }
+  }
+  const contextMarkOf = (ent) => {
+    if (!ctxCutoffMs || !ent) return "";
+    if (String(ent.kind || "") !== "turn") return "";
+    if (normSid(ent.session) !== ctxSession) return "";
+    const ts = Date.parse(String(ent.ts || ""));
+    return Number.isFinite(ts) && ts > ctxCutoffMs ? "〔当前会话·压缩后·上下文内〕" : "";
+  };
   // v0.40（B-99②）：guide 命中把指针换成真条目再渲染
+  const ctxEntOf = (doc) => {
+    const real = resolveGuideDoc(doc);
+    return (real && real.entry) || (doc && doc.entry) || null;
+  };
   const renderHit = (doc) => {
     const real = resolveGuideDoc(doc);
     if (!real) return formatSearchHit(doc, srcIdx);
     return `${formatSearchHit({ ...real, ended: doc.ended }, srcIdx)}（经线索找到）`;
   };
-  const lines = picked.map((c) => renderHit(c.doc));
+  // 2026-11-20 治乱回忆：还在当前上下文里的命中不展开正文，只留一句提示
+  const inCtxDocs = [];
+  const lines = [];
+  for (const c of picked) {
+    if (contextMarkOf(ctxEntOf(c.doc))) {
+      inCtxDocs.push(c.doc);
+      continue;
+    }
+    lines.push(renderHit(c.doc));
+  }
   // v0.40（B-98）：字面兜底追加——排在 BM25 命中之后，不顶掉真命中
   if (charCfg.on && charCandD.length) {
     const pickedDocs = new Set(picked.map((c) => c.doc));
@@ -4804,7 +5075,13 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
       .slice(0, charCfg.limit);
     if (extra.length) {
       lines.push(`（下面 ${extra.length} 条是字面兜底：二元组没重合，单字重合度高——问法和原文用词可能不一样，自己核对）`);
-      for (const c of extra) lines.push(renderHit(c.doc));
+      for (const c of extra) {
+        if (contextMarkOf(ctxEntOf(c.doc))) {
+          inCtxDocs.push(c.doc);
+          continue;
+        }
+        lines.push(renderHit(c.doc));
+      }
     }
   }
   // 降级时要说清楚：以下是过期的，不是现状
@@ -4825,6 +5102,7 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
   const prependCount = briefCfg.enabled === false ? 0 : Math.max(0, Number(briefCfg.prependHits ?? 3) || 0);
   if (prependCount > 0) {
     const heads = picked
+      .filter((c) => !contextMarkOf(ctxEntOf(c.doc)))
       .map((c) => {
         const ent = (resolveGuideDoc(c.doc) || {}).entry || c.doc.entry;
         return { brief: briefOf(ent), hash: ent?.hash ? String(ent.hash) : "" };
@@ -4833,6 +5111,19 @@ function searchMemory(query, layer, limit, tag, includeVoided = false, minScore 
       .slice(0, prependCount)
       .map((h, i) => `${i + 1}. ${h.brief}${h.hash ? `  #${h.hash}` : ""}`);
     if (heads.length) lines.unshift(`【要点】\n${heads.join("\n")}`);
+  }
+  if (inCtxDocs.length) {
+    const tags = inCtxDocs
+      .map((d) => {
+        const real = resolveGuideDoc(d) || d;
+        const h = String((real && real.entry && real.entry.hash) || "");
+        return h ? "#" + h.slice(0, 8) : "";
+      })
+      .filter(Boolean)
+      .join(" ");
+    // 2026-11-20：加一个随机短码——这行是「提示」不是「条目」，带个码更容易被当成独立记录读到
+    const ctxTag = Math.random().toString(36).slice(2, 6).toUpperCase().padStart(4, "0");
+    lines.push(`（另有 ${inCtxDocs.length} 条命中属于当前会话压缩后的对话，内容还在上文里，不展开${tags ? "：" + tags : ""}）〔上下文内·#${ctxTag}〕`);
   }
   return lines.join("\n");
 }
@@ -4881,6 +5172,9 @@ function voidMemory(args) {
         delete entry.voided;
       } else {
         entry.voided = { at: nowISO(), reason: clip(reason, 200) };
+        // 2026-11-20：替换链——旧条不删，但记清「被谁取代」，检索/定位时能一路追到新条
+        const supBy = String(args?.by || "").trim().toLowerCase();
+        if (supBy) entry.voided.supersededBy = supBy;
       }
       touched += 1;
     });
@@ -4926,6 +5220,16 @@ function voidMemory(args) {
 }
 
 // 用 hash 或关键词精确定位原文：返回 文件:行号 + 完整 JSONL 行
+// 2026-11-20：原文行是 UTC（...Z），旁边给一行北京时间换算——原文一个字不改
+function beijingStampOf(entry) {
+  const raw = String((entry && (entry.ts || entry.at || entry.until || (entry.voided && entry.voided.at))) || "");
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) return "";
+  const d = new Date(ms + 8 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
 function locateMemory(args) {
   const hash = String(args?.hash || "").trim().toLowerCase();
   const keyword = String(args?.keyword || "").trim().toLowerCase();
@@ -4952,8 +5256,9 @@ function locateMemory(args) {
         const where = file === PATHS.persona ? "behavior/persona.md" : rel(file);
         const kind = entry?.kind || "line";
         const provenance = entryProvenance(entry, srcIdx);
+        const supNote = entry?.voided && entry.voided.supersededBy ? `  → 被 #${String(entry.voided.supersededBy).slice(0, 8)} 取代` : "";
         const voidNote = entry?.voided
-          ? `  〔已标废：${entry.voided.reason || "无原因"}　${String(entry.voided.at || "").slice(0, 16)}〕`
+          ? `  〔已标废：${entry.voided.reason || "无原因"}　${String(entry.voided.at || "").slice(0, 16)}${supNote}〕`
           : "";
         // v0.39（B-93）门牌：能精确就写精确位置；拿不到就写「位置未知」，绝不猜
         const gate =
@@ -4962,8 +5267,9 @@ function locateMemory(args) {
             : entry?.session
               ? `\n  门牌：只知道会话 ${entry.session}，序号未知（回原文：memory_recall session=${entry.session}，别猜位置）`
               : `\n  门牌：位置未知（这条没记会话/序号，不猜；可用 memory_search 找相邻记录）`;
+        const stamp = beijingStampOf(entry);
         out.push(
-          `${where}:${index + 1}  [${kind}${entry?.keyword ? ` · ${entry.keyword}` : ""}]  hash=${entry?.hash || "无"}${provenance ? `  ${provenance}` : ""}${voidNote}${gate}\n  ${clip(line, 800)}`,
+          `${where}:${index + 1}  [${kind}${entry?.keyword ? ` · ${entry.keyword}` : ""}]  hash=${entry?.hash || "无"}${provenance ? `  ${provenance}` : ""}${voidNote}${stamp ? `\n  时间：${stamp}（北京时间）` : ""}${gate}\n  ${clip(line, 800)}`,
         );
       });
   }
@@ -5181,6 +5487,7 @@ function recallSession(args) {
     const cands = pickCandidates(asTurns, { max: 8 });
     if (cands.length) {
       const res = appendCandidates(path.join(MEM_DIR, "deep", "session-candidates.jsonl"), cands, { source: "session:" + id });
+      if (res && res.added) spawnPoolJudge("入池后");
       if (res.added) poolNote = `\n（已把 ${res.added} 条候选放进会话候选池，待确认）`;
     }
   } catch (err) {
@@ -8844,6 +9151,35 @@ ${selfText}
       if (!isEnabledForSession(cfg, sessionId)) return;
       writeTurnDiary(agent, slice);
 
+      // v0.49.0（2026-11-20 丹阳定）：原文落盘后巡检「约定书签」——
+      // 同一约定只能存在一个：没相似就记，有相似就反馈（不重复记）。零模型、零 token。
+      try {
+        const turnForAgree = extractTurn(slice);
+        const userText = String(turnForAgree?.user || "");
+        if (userText) {
+          queueNonWork(sessionId, userText, turnForAgree?.tools || []);
+          const scan = scanAgreements(loreLayer(), userText, { source: "turn:" + sessionId, known: knownForAgreement(), rejected: rejectedForAgreement() });
+          // 危险线 / 荒诞线拦下的，直接进黑名单——下次同句不再触发（丹阳 2026-11-20）
+          for (const d of scan.danger || []) rejectAgreement(d.text, "危险：" + d.why);
+          for (const a of scan.absurd || []) rejectAgreement(a.text, "荒诞：" + a.why);
+          const line = summarizeAgreements(scan);
+          if (line) {
+            appendJsonl(PATHS.agreementLog, {
+              ts: new Date().toISOString(),
+              session: sessionId,
+              checked: scan.checked,
+              candidates: scan.candidates,
+              dup: scan.dup,
+              skipped: scan.skipped,
+              summary: line,
+            });
+            diag("约定书签：" + line);
+          }
+        }
+      } catch (err) {
+        diag("约定巡检失败（不影响主流程）：" + (err?.message || err));
+      }
+
       // v1.0（2026-11-15）：习惯自动核对——拿本轮助手回复跑正则，零模型成本
       try {
         const turnForHabit = extractTurn(slice);
@@ -8948,35 +9284,6 @@ ${selfText}
       render: (_args, value) => [{ type: "text", text: String(value) }],
     };
 
-    // v0.45.0 按需拆开：常用工具启动即注册，长尾先排队，等 tools_switch action=on pkg=memory-tail 再展开。
-    // 逃生门：环境变量 MEMORY_TOOLSET=full 时全部启动即注册（老行为）。
-    const HOT_TOOLS = new Set([
-      "memory_people",
-      "memory_write",
-      "memory_search",
-      "memory_core",
-      "memory_pickup",
-      "memory_stats",
-      "memory_doctor",
-      "memory_state",
-      "memory_locate",
-      "memory_void",
-      "tools_switch",
-    ]);
-    const fullToolset = String(process.env.MEMORY_TOOLSET || "").toLowerCase() === "full";
-    const queuedTools = [];
-    const flushQueuedTools = () => {
-      const n = queuedTools.length;
-      for (const def of queuedTools.splice(0)) {
-        try {
-          toolCtx.tools.register(def);
-          diag(`工具注册成功：${def.name}（长尾展开）`);
-        } catch (err) {
-          diag(`工具注册失败：${def.name} → ${err?.stack || err}`);
-        }
-      }
-      return n;
-    };
     // 给「绑定规则」用的工具名通道（每次现取，热载进来的工具也能算数）
     schemaProvider = () => {
       const list = toolCtx.tools?.schemas?.() || [];
@@ -8984,11 +9291,6 @@ ${selfText}
     };
 
     const register = (definition) => {
-      const name = definition?.name;
-      if (!fullToolset && name && !HOT_TOOLS.has(name)) {
-        queuedTools.push(definition);
-        return;
-      }
       try {
         toolCtx.tools.register(definition);
         diag(`工具注册成功：${definition.name}`);
@@ -9001,35 +9303,35 @@ ${selfText}
 
       name: "memory_write",
       description:
-        "写入一条长期记忆。layer=relation（关键词-释义对，如称呼/爱好/旧账，每轮注入，常用的放这里）| user（用户档案：兴趣爱好、习惯、背景资料等，不常注入，需要时用 memory_search layer=user 查）| memo（便签：工作交接、临时草稿，可随时清空）| note（临时笔记）| saying（常言/口头禅的细节解释）| persona（人设设定）| diary（日记条目）。重要的事一定要写进来，否则下次会话不会记得。出处：source 记「谁说的/在哪看到的」（如「UP主@BV号」），quote 标原文（verbatim）还是转述（paraphrase）；找不到出处就留空，不编造。images/audios 可带本地图片或音频路径（音频支持 mp3/wav/m4a/aac/ogg/opus/flac/webm/amr），一起存进记忆资产库（适合人物设定、截图、示意图、语音片段），带 source 时会顺手登记资产出处。tags 可给条目打分类标签（除 persona 外都支持，更新时旧标签自动保留合并；写 -标签 表示删除该标签），只接受固定词表，词表外会被忽略。梗/口头禅/网络传说类请用 saying 层，关系层只放人和关系。diary 可加 important=true 标重要事件。note 可写备注（跟条目一起落盘并写进 guide 索引）；state 标记这条记忆的可信状态（做过 / 没做成 / 听说，配 proof 写依据），不标就是不标；计划/承诺类给 until（到期时间），到点会被到期提醒推一次；写入返回里的 hash 可用 memory_locate 定位原文。之后用 memory_search 的 tag 参数按标签查。【使用规则】不编造：没有证据的结论不要写成事实——标 `state=heard` 并写清 proof（谁说的/在哪看到的）；出处栏找不到就留空，绝不编。",
+        "写一条长期记忆——不写，下次会话就没有。层：relation=人和关系（最常用，每轮注入）；user=档案；note=笔记；memo=便签；saying=梗/口头禅；persona=人设；diary=日记。梗和口头禅进 saying，关系层只放人和关系。【红线】不编造：没证据的结论标 state=heard 并写 proof（谁说的），出处找不到就留空。返回的 hash 可用 memory_locate 定位原文。",
       parameters: {
         type: "object",
         properties: {
-          layer: { type: "string", enum: ["relation", "user", "memo", "note", "saying", "persona", "diary"], description: "写一条长期记忆。layer 选层：relation 常用/每轮注入、user 档案、note 笔记、saying 常言、memo 便签、diary 日记、persona 人设；可带 tags/aliases/cue。" },
+          layer: { type: "string", enum: ["relation", "user", "memo", "note", "saying", "persona", "diary"], description: "记忆层，各层判据见工具说明" },
           text: { type: "string", description: "note/diary/persona/user/memo 的正文" },
           keyword: { type: "string", description: "relation/saying 的关键词；user 可选（给关键词则同关键词更新，不给则追加）" },
           meaning: { type: "string", description: "relation/saying 的详细解释或含义" },
           links: { type: "string", description: "关联的关键词或文件，可留空" },
-          source: { type: "string", description: "出处：一行短串「作者@平台ID」（如「小羊MC解说@BV1jNpo61E39」），或直接给 URL / 书名。找不到出处就留空，不编造；配合 images/audios 写入时会自动把这条出处挂到资产上" },
-          quote: { type: "string", enum: ["verbatim", "paraphrase"], description: "verbatim=原文照抄；paraphrase=我自己的转述（找不到出处时才可转述，且要标 paraphrase）" },
+          source: { type: "string", description: "出处「作者@平台ID」或 URL / 书名；找不到就留空，不编造。带 images/audios 时自动挂到资产上" },
+          quote: { type: "string", enum: ["verbatim", "paraphrase"], description: "verbatim 原文照抄 / paraphrase 我的转述" },
           note: {
             type: "string",
-            description: "备注：跟着条目一起落盘的人类可读说明（不参与检索主键），同时写进 deep/guide.jsonl 索引；写入返回里会给 hash，之后用 memory_locate 按 hash 定位原文",
+            description: "人类可读备注（跟着落盘，进 guide 索引）",
           },
           sourceKind: {
             type: "string",
             enum: ["user_said", "assistant_said", "told", "imagined", "inferred", "tool"],
-            description: "来源三档（v1.0）：user_said=用户说的（默认，不标）/ assistant_said=我说的或我承诺的 / told=听别人转述 / imagined=想象或创作 / inferred=我推断的 / tool=工具结果。检索和召回会给非用户来源打标（〔我说〕〔听说〕〔推断〕…），防止「我说的」被当成「用户说的」。",
+            description: "user_said 用户说（默认）/ assistant_said 我说的 / told 转述 / imagined 创作 / inferred 推断 / tool 工具结果；非 user_said 检索时会打标",
           },
           tags: {
             type: "array",
             items: { type: "string" },
-            description: "分类标签，最多 6 个、每个 ≤16 字；也可传逗号/顿号/空格分隔的字符串。只接受固定词表：称呼/身份/关系/工作/背景/记忆/插件/备份/会话/形象/图标/语言/常言/性格/第一次/视频/表情包/梗/生活/金钱/学习/待办；词表外的会被忽略并在返回里提示。成语/梗类条目请用 saying 层",
+            description: "≤6 个、每个 ≤16 字；只认词表：称呼/身份/关系/工作/背景/记忆/插件/备份/会话/形象/图标/语言/常言/性格/第一次/视频/表情包/梗/生活/金钱/学习/待办；词表外忽略。梗用 saying 层",
           },
           aliases: {
             type: "string",
             description:
-              "别名/别称：用户可能用来说这件事的**其他说法**，逗号或空格分隔（最多 8 个、每个 ≤16 字）。存进去后会被一起检索——比如条目叫「小号回话节奏」，别名写「回话间隔 回复频率」。v0.35/B-56：这是修「同义改写搜不到」的写入侧手段，比调检索权重管用",
+              "其他说法（≤8 个、每个 ≤16 字），一起检索——修同义改写搜不到",
           },
           important: {
             type: "boolean",
@@ -9038,15 +9340,15 @@ ${selfText}
           state: {
             type: "string",
             enum: ["done", "failed", "heard"],
-            description: "这条记忆的可信状态：done=做过（有回执）/ failed=没做成（配 proof 写失败原因）/ heard=听说或转述（未验证）。不传=不标；标了之后注入和检索都带〔做过〕〔没做成〕〔听说〕前缀，避免把「听说」「没做成」当既成事实说",
+            description: "done 做过（有回执）/ failed 没做成 / heard 听说未验证；标了会带〔做过〕〔没做成〕〔听说〕前缀",
           },
           proof: {
             type: "string",
-            description: "可选：状态依据——done 给回执（工具/链接/文件），failed 给失败原因，heard 给谁说的",
+            description: "state 的依据：done 给回执，failed 给原因，heard 给谁说的",
           },
           until: {
             type: "string",
-            description: "可选：到期时间（YYYY-MM-DD 含当天，或带时区的 ISO）。写「欠着的事/计划/承诺」时用它；过了这个时间这条会算「已结束：到期」，并被到期提醒推一次（config.due.enabled 默认关）。不传就不写这个字段",
+            description: "到期日 YYYY-MM-DD；过了算「已结束：到期」，会提醒一次",
           },
           cue: {
             type: "object",
@@ -9056,17 +9358,17 @@ ${selfText}
               when: { type: "string", description: "时间锚：那天前后发生了什么" },
               co: { type: "string", description: "共现：同一条会话里还提到谁、哪件事" },
             },
-            description: "线索（cue）：检索时用来「勾出」这条记忆的情境线索（relation/saying/diary 支持）；命中线索的条目在检索时加分。值都会截到 60 字",
+            description: "情境线索（relation/saying/diary），命中时加分；每项截 60 字",
           },
           images: {
             type: "array",
             items: { type: "string" },
-            description: "要一并存入记忆的本地图片或音频路径（图片 png/jpg/jpeg/webp/gif/avif/bmp；音频 mp3/wav/m4a/aac/ogg/opus/flac/webm/amr）。复制进 ~/.dsh/memory/assets，文件名用可读名 + 8 位哈希后缀，方便溯源；同内容只存一份",
+            description: "本地图片路径；复制进 assets，同内容只存一份",
           },
           imageNames: {
             type: "array",
             items: { type: "string" },
-            description: "可选：与 images 一一对应的可读文件名（如「V4-构成主义-蓝白」），留空则用原文件名",
+            description: "与 images 一一对应的可读名，留空用原文件名",
           },
           audios: {
             type: "array",
@@ -9090,17 +9392,17 @@ ${selfText}
                 },
               ],
             },
-            description: "可选：本地音频列表。可以给路径字符串，也可以给对象带分类——source/kind/use 三组只收固定枚举（非法值丢弃，不猜）；分类只到整文件级，不做分段与时间轴跳转（v0.36）。支持 mp3/wav/m4a/aac/ogg/opus/flac/webm/amr",
+            description: "本地音频：路径字符串，或带分类的对象（source/kind/use 只收固定枚举，非法值丢弃）",
           },
           audioNames: {
             type: "array",
             items: { type: "string" },
-            description: "可选：与 audios 一一对应的可读文件名，留空则用原文件名",
+            description: "与 audios 一一对应的可读名，留空用原文件名",
           },
           transcripts: {
             type: "array",
             items: { type: "string" },
-            description: "可选：与音频一一对应的转写文本；不传时自动读取同目录同名 .txt（如 voice.mp3 → voice.txt）。转写会存进条目、参与检索",
+            description: "与音频对应的转写；不传会自动读同名 .txt",
           },
         },
         required: ["layer"],
@@ -9120,12 +9422,12 @@ ${selfText}
 
       name: "memory_search",
       description:
-        "按关键词跨层记忆全文检索：behavior（人设/关系/笔记/日记，日常先用这个）、deep（常言/树状日记/引导）、array（会话索引）、user（用户档案）、memo（便签）、all。多词查询用空格/顿号/逗号分隔，默认取交集（全部命中），全不命中时退回部分命中；结果尾部 #hash 可用 memory_locate 定位原文。也可用 tag 参数按标签过滤（只给 tag 时可不给 query）；只给 layer=memo 或 layer=user 时会直接列出该层条目（用于「看看便签/用户档案」）。",
+        "跨层检索：behavior 人设/关系/笔记/日记（日常先用）、deep 常言/树状日记/引导、array 会话索引、user 档案、memo 便签、all。多词取交集，全不中退回部分命中；结果 #hash 用 memory_locate 取原文。只给 layer=memo/user 时直接列出该层。",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "跨层检索记忆：behavior 日常先用、deep 常言/日记、array 会话索引、user 档案、memo 便签、all；多词取交集，结果带 #hash。" },
-          layer: { type: "string", enum: ["behavior", "deep", "array", "user", "memo", "all"], description: "限定层，默认 all；也可以用逗号写多层，如「behavior,deep」" },
+          query: { type: "string", description: "检索词（空格/顿号/逗号分多词，默认取交集）" },
+          layer: { type: "string", enum: ["behavior", "diary", "deep", "array", "user", "memo", "all"], description: "层，默认 all；可逗号写多个。diary=只要真日记（turn 对话流水不进）" },
           layers: { type: "array", items: { type: "string" }, description: "多层的写法（数组）：如 [\"behavior\",\"deep\"]；和 layer 同时给时以 layers 为准" },
           since: { type: "string", description: "只要这个时间之后的条目：YYYY-MM-DD（本机时区当天 00:00 起）或带时区的 ISO" },
           until: { type: "string", description: "只要这个时间之前的条目：YYYY-MM-DD（含当天 23:59:59）或带时区的 ISO" },
@@ -9134,18 +9436,19 @@ ${selfText}
           limit: { type: "number", description: "最多返回条数，默认 20" },
           tag: { type: "string", description: "按标签过滤（子串匹配，如「第一次」）；可与 query 组合取交集" },
           includeVoided: { type: "boolean", description: "把「已标废」的条目也返回（默认不返回；行首标〔已标废〕）" },
-          minScore: { type: "number", description: "只要分数 ≥ 这个值的结果（默认 0＝不过滤）。排序分是 BM25＋加成，量级约 0–20；结果看着偏杂时可以试 3–5" },
-          includeEnded: { type: "boolean", description: "把「已结束」（被取代／到期）的条目也带出来（默认不返回；一条生效的都没有时会自动降级带出，并标注〔已结束〕）" },
-          scope: { type: "string", enum: ["context"], description: "v0.21：scope=context 只检索「当前场景可见」的社交记忆（群聊=本群 + 本群发言人；私聊=对方 + 主人的私事；别人的私事、别的群的内容永远不出现）。不传 personId/groupId 时用最近一次识别到的场景" },
+          minScore: { type: "number", description: "分数下限（默认 0 不过滤，量级 0–20）；结果杂时试 3–5" },
+          includeEnded: { type: "boolean", description: "带出「已结束」的条目（默认不返回；一条生效的都没有时会自动带出并标注）" },
+          scope: { type: "string", enum: ["context"], description: "context=只看当前场景可见的社交记忆（群聊=本群+发言人；私聊=对方+主人私事）。不传 personId/groupId 用最近场景" },
           personId: { type: "string", description: "scope=context 时：按某人的场景检索（不传就用最近场景）" },
           groupId: { type: "string", description: "scope=context 时：按某个群检索（不传就用最近场景）" },
         },
       },
       output,
-      async execute(args) {
+      async execute(args, exec) {
         try {
           if (String(args?.scope || "") === "context") return searchSocialContext(social, args || {});
           return searchMemory(args?.query, {
+            contextSession: String(exec?.agent?.session?.header?.id || ""),
             layer: args?.layer,
             layers: args?.layers,
             limit: args?.limit,
@@ -9246,18 +9549,18 @@ ${selfText}
 
       name: "memory_grants",
       description:
-        "记忆条目的授权索引（只读 observe 档，B-97）：把「这条记忆允许我做什么」按四条判据算出来——read 本地读取 / inject 进注入 / cite 对外引用 / share 原样发出。判据是确定性的：cite 要求有出处（source），share 还要求原文照抄（quote=verbatim）且不是听说（state≠heard）。action=list 列条目、check 按 hash/keyword 看一条的四项判定与理由、stats 看分布（多少条能引用、多少条没出处、标废几条）、shadow 看「影子记录」——真去拦之前先把本该拒绝的动作记在 deep/grants-shadow.jsonl 里，用来复盘误伤率。只读：不改任何记忆条目，只维护派生文件 deep/grants.jsonl。",
+        "记忆条目的授权索引：按四条判据算「这条记忆允许我做什么」——read 本地读 / inject 进注入 / cite 对外引用 / share 原样发出。判据确定：cite 要有出处（source），share 还要原文照抄（verbatim）且不是听说。list 列条目、check 按 hash/keyword 看四项判定与理由、stats 看分布、shadow 看影子记录（当前无写入点，恒为 0，别当成「没有误伤」）。只读，只维护 deep/grants.jsonl。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["list", "check", "stats", "shadow"], description: "默认 list" },
           hash: { type: "string", description: "action=check 用：条目 hash（可只给前 8 位）" },
           keyword: { type: "string", description: "action=check 用：按标题/关键词匹配" },
-          kind: { type: "string", description: "action=list 用：只列某个 kind（relation / note / diary / saying / user / memo）" },
-          layer: { type: "string", description: "action=list 用：只列某层（behavior / deep / user / memo）" },
-          audience: { type: "string", enum: ["self", "owner"], description: "action=list 用：读者范围" },
-          grantAction: { type: "string", enum: GRANT_ACTIONS, description: "action=list 用：只看某一动作有判定的条目" },
-          onlyDenied: { type: "boolean", description: "action=list 用：只看至少有一项被拒的" },
+          kind: { type: "string", description: "list：只列某个 kind" },
+          layer: { type: "string", description: "list：只列某层" },
+          audience: { type: "string", enum: ["self", "owner"], description: "list：读者范围" },
+          grantAction: { type: "string", enum: GRANT_ACTIONS, description: "list：只看某动作有判定的" },
+          onlyDenied: { type: "boolean", description: "list：只看有被拒项的" },
           limit: { type: "number", description: "最多几条，默认 20" },
         },
       },
@@ -9299,7 +9602,7 @@ ${selfText}
           }
           if (action === "shadow") {
             const s = engine.shadowStats();
-            if (!s.total) return `影子记录还是空的（${s.file}）：没有拦过任何动作，所以没有误伤可复盘。`;
+            if (!s.total) return `影子记录为空（${s.file}）：当前版本没有调用点写入它——这不代表没有误伤，只代表没在记（状态板 S10 已标 closed）。`;
             const byAct = Object.entries(s.byAction)
               .map(([a, n]) => `${a} ${n}`)
               .join(" / ");
@@ -9328,7 +9631,7 @@ ${selfText}
 
       name: "memory_self",
       description:
-        "自我层（B-101）：记我自己挑出来要记住的东西——风格（怎么写、怎么说）、习惯（做事顺序、容易踩的坑）、事情（我判断重要但没人让我记的）。每条写入都留一份镜像并记指纹（指纹 = kind|text|importance 的 sha1）；审计时比对三个文件，发现丢了/被改了就从镜像补回来。节奏：每几段话自动查一次，不对就补；这次没补完，下一段继续；补完了再等几段再查（config.self.audit.everyN / fixPerTurn，默认 4 / 2）。注入独立 400 字预算，不占核心卡。action=write 写一条 | list 列条目 | audit 只查不补 | repair 按 id 从镜像修（不给 id 就按节奏补一小批）| void 标废（不删）| stats 看规模与文件位置。",
+        "自我层：记我自己挑出来要记住的——style 怎么写/怎么说、habit 做事顺序与坑、fact 我判断重要但没人让我记的、lesson 教训。每条写入选镜像+指纹，审计发现丢了/被改就从镜像补回；每几段话自动查一次（config.self.audit.everyN/fixPerTurn）。注入独立 400 字预算，不占核心卡。action=write | list | audit 只查不补 | repair 按 id 从镜像修 | void 标废 | stats。",
 
       parameters: {
         type: "object",
@@ -9409,20 +9712,20 @@ ${selfText}
 
       name: "memory_opening",
       description:
-        "开幕表的读写口：一张「特殊日子 / 一次性提醒」表，每天第一次打开 DSH 时读一次（不是每轮注入）。两种用法：①一次性提醒——add 给 inDays（如 30，表示一个月后）或 date（YYYY-MM-DD），到那天提示一次、提示完自动删；②每年的事——add 给 repeat=yearly（阳历）或 lunar（如 09-16，农历，按换算表每年自动补下一年的行）。list 看全部待办、remove 按 hash 或 label 删。写进来的东西会进 deep 层检索，所以事后也搜得到（带 source 出处）。",
+        "开幕表的读写口：一张「特殊日子/一次性提醒」表，每天第一次打开 DSH 时读一次（不是每轮注入）。add 给 inDays（30=一个月后）或 date（YYYY-MM-DD），到那天提示一次、提示完自动删；每年的事给 repeat=yearly 或 lunar（09-16）。list 看全部、remove 按 hash 或 label 删。写进来的东西会进 deep 层检索，事后搜得到。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["list", "add", "remove"], description: "默认 list" },
           label: { type: "string", description: "这件事叫什么（add 必填；remove 时按它精确匹配）" },
           date: { type: "string", description: "add 用：阳历日期 YYYY-MM-DD" },
-          inDays: { type: "number", description: "add 用：从今天起 N 天后（如 30=一个月后）；给 date 时忽略" },
+          inDays: { type: "number", description: "add：从今天起 N 天后；给 date 时忽略" },
           lunar: { type: "string", description: "add 用：农历「月-日」，如 09-16" },
           repeat: { type: "string", enum: ["yearly"], description: "add 用：每年同日重复" },
           note: { type: "string", description: "补充说明（会跟着提醒一起显示）" },
           source: { type: "string", description: "出处：谁说的/依据什么（如「丹阳 2026-11-02 说」）" },
-          once: { type: "boolean", description: "add 用：一次性提醒（默认按一次性处理；加 repeat/lunar 才是长期的）" },
-          maxReminders: { type: "number", description: "add 用：提醒满几次后自动删除（仅对 repeat=yearly 这类常驻行有效；0/不填 = 一直留着）" },
+          once: { type: "boolean", description: "add：一次性提醒（加 repeat/lunar 才是长期）" },
+          maxReminders: { type: "number", description: "add：提醒满几次自动删（仅 repeat 行；0/不填=一直留）" },
           hash: { type: "string", description: "remove 用：条目 hash（可只给前 8 位）" },
         },
       },
@@ -9582,6 +9885,7 @@ ${selfText}
           keyword: { type: "string", description: "或按关键词定位（配合 layer）" },
           layer: { type: "string", enum: ["behavior", "deep", "array", "user", "memo", "all"], description: "限定层，默认 all" },
           reason: { type: "string", description: "为什么作废（必填，写进条目，以后 memory_locate 能看到）" },
+          by: { type: "string", description: "替换链：被哪条新记忆取代（新条 hash，可只给前 8 位）。给了就记成 supersededBy，旧条检索/定位时显示「→ 被 #新 取代」。注意：note/memo/diary 这类追加型层不会自动建链，只有 relation/saying 同 keyword 更新时才自动生成 supersedes。" },
           action: { type: "string", enum: ["void", "unvoid"], description: "默认 void=标废；unvoid=恢复" },
         },
       },
@@ -9621,16 +9925,16 @@ ${selfText}
     register({
       name: "memory_core",
       description:
-        "核心记忆拆三个文件（都常驻注入、压缩后自动补回，优先级高于其它记忆）：①behavior/core.md = 不会经常变的内容（称呼约定、用户、能力），600 字预算；②behavior/core-rules.md = 行为规则（说话方式、红线、约定），400 字预算，**只在规则改过或压缩后各注入一次**，状态变化不会把规则再提醒一遍；③behavior/core-state.md = 会变的状态（当前主线、进度、待办），300 字预算（封顶，实际用不满）。三份分开截断、分开报字数。action=get 读 | set 覆盖写（text，超过硬上限 2×预算会被拒）| append 追加一行 | clear 清空（先归档到 behavior/archive/core*.md）| **reset 一句话复位**（清本会话注入指纹→下一步把三张卡重新注入一次；text 可带一句临时约束，只对本次会话生效、注入一次即弃、不写任何文件）。target=core（默认）| rules | state。不要写成日记或流水账。**主人锁（v1.0）**：以「[主人]」开头的行受保护——set/clear 若删改它们会被拒绝，确需改动要显式带 ownerRelease=true；append 加 owner=true 会把这一行标成主人行。",
+        "核心记忆拆三份，都常驻注入、压缩后自动补回：core=不会变的（称呼/用户/能力，400 字）｜rules=怎么办事（说话/红线/约定，400 字，只在规则改过或压缩后各注入一次）｜state=会变的（主线/进度/待办，300 字）。action=get 读 | set 覆盖 | append 追加一行 | clear 清空（先归档）| reset 一句话复位（只清本会话注入指纹，不动文件；text 可带一句只对本会话生效的临时约束）。set 超 2× 预算会被拒。别写成日记或流水账。主人锁：以「[主人]」开头的行受保护，set/clear 删改会被拒，确需动要 ownerRelease=true。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["get", "set", "append", "clear", "reset"] },
-          target: { type: "string", enum: ["core", "rules", "state"], description: "三张常驻卡：core 我是谁、rules 怎么办事、state 主线进度待办。action=get/set/append/clear/reset，target 选 core|rules|state。" },
-          text: { type: "string", description: "set=全文覆盖；append=追加一行（不要以 - 开头，会自动处理）；reset=可选的一次性临时约束（只对本次会话生效）" },
-          owner: { type: "boolean", description: "append 用：true = 这一行标成主人行（前面加「[主人]」），以后受保护" },
-          ownerRelease: { type: "boolean", description: "set/clear 用：true = 明确允许改动受保护的主人行（用户当场同意的才用）" },
-          force: { type: "boolean", description: "写入荒诞/危险规则（如「不许吃饭」）时用：默认会被拒，显式 force=true 才写（用户当场要求的才用）" },
+          target: { type: "string", enum: ["core", "rules", "state"], description: "core 我是谁 / rules 怎么办事 / state 主线进度待办" },
+          text: { type: "string", description: "set=全文覆盖；append=追加一行；reset=一句只对本会话生效的临时约束" },
+          owner: { type: "boolean", description: "append 用：标成主人行（受保护）" },
+          ownerRelease: { type: "boolean", description: "set/clear 用：允许改动主人行（用户当场同意才用）" },
+          force: { type: "boolean", description: "写荒诞/危险规则（如「不许吃饭」）默认拒，用户当场要求才用 force" },
         },
       },
       output,
@@ -9721,13 +10025,13 @@ ${selfText}
     register({
       name: "memory_learn",
       description:
-        "学习层（v1.0，2026-11-15）：管两样会变的东西，都不进核心卡。①**习惯**（程序性规则：标点、禁用词、交互小规矩）——action=habit-add 加一条（forbid/require 要带 pattern 正则；note 只记录不追踪）；**自动追踪**：每轮结束拿助手回复跑一遍 pattern，连对 graduateStreak（默认 8）轮自动「毕业退场」腾槽位，反弹自动复活，零模型成本；也可 action=habit-track 手动记一次。②**表达库反馈**：action=feedback kind=helpful|harmful 给某条常言/例句加减分（按 hash 或 keyword 定位），检索时有用加分、有害扣分，累计 3 次负反馈自动停用。habit-list 看清单、habit-stats 看规模、habit-remove 删一条（归档不丢）。",
+        "学习层：管两样会变、都不进核心卡的东西。①习惯（标点/禁用词/交互小规矩）：habit-add 加一条（forbid/require 要带 pattern 正则；note 只记录）；每轮结束自动拿回复跑 pattern，连对 8 轮毕业退场、反弹复活。②表达库反馈：feedback kind=helpful|harmful 给常言/例句加减分，累计 3 次负反馈自动停用。另有 habit-list / habit-stats / habit-remove（归档不丢）。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["habit-add", "habit-list", "habit-track", "habit-stats", "habit-remove", "feedback"], description: "要做什么" },
           text: { type: "string", description: "habit-add 用：一句话说清这条习惯（如「句末不加句号」）" },
-          pattern: { type: "string", description: "habit-add 用：用来核对的正则（如 \\u3002$ 表示句末句号）" },
+          pattern: { type: "string", description: "habit-add 用：核对用的正则" },
           mode: { type: "string", enum: ["forbid", "require", "note"], description: "habit-add 用：forbid=命中即违例（默认）/ require=必须命中 / note=只记录不追踪" },
           id: { type: "string", description: "habit-track / habit-remove 用：习惯 id（可只给前几位）" },
           ok: { type: "boolean", description: "habit-track 用：这一轮做到没做到" },
@@ -9735,7 +10039,7 @@ ${selfText}
           hash: { type: "string", description: "feedback 用：常言条目 hash（可只给前几位）" },
           keyword: { type: "string", description: "feedback 用：按常言关键词定位（hash 找不到时用）" },
           includeInactive: { type: "boolean", description: "habit-list 用：连已毕业/停用的一起列" },
-          force: { type: "boolean", description: "habit-add 用：荒诞/危险习惯（如「不许吃饭」）默认拒收，显式 force=true 才记" },
+          force: { type: "boolean", description: "荒诞/危险习惯默认拒收，用户当场要求才用 force" },
           limit: { type: "number", description: "habit-list 用：最多几条，默认 50" },
         },
         required: ["action"],
@@ -9792,15 +10096,17 @@ ${selfText}
     register({
       name: "memory_lorebook",
       description:
-        "世界书 / 书签（v1.0，2026-11-15）：专门放**额外记录的背景资料**（名词解释、设定、前情、人物关系细节），**关键词命中才进上下文**，不命中的一条都不带——像小说软件的世界书、书里的书签。**它不是规则**（注入块里写死了这句）：只用来把话说准，不改变行为准则。零模型成本。action=add（name+content，keywords 逗号分隔；或 always=true 常驻）| update（按 id 改）| remove（按 id）| list | check（给 text 试命中，看会注入哪几条）。",
+        "约定书签（世界书）：把「跨会话要守的约定/口径/禁令」挂在关键词上，命中才注入，不命中一条都不带。**不是规则册**（R 编号是唯一源，书签不能覆盖规则），也不放背景设定/名词解释。**一条=一个事件**（name 是事件名，同一事件只存一条；换值用 update 改 state，不新开）。action=add（name+content+keywords，或 always=true）| update（按 id）| remove（按 id）| list | check（试命中）。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["add", "update", "remove", "list", "check"] },
           id: { type: "string", description: "update / remove 用：条目 id（可只给前几位）" },
-          name: { type: "string", description: "add 必填：这条书签叫什么（如「静远联邦·布鲁日」）" },
-          keywords: { type: "string", description: "触发关键词，逗号/顿号分隔（如「布鲁日,联邦首城」）；always=true 时可省" },
-          content: { type: "string", description: "add 必填：要记的内容（一两句话说清；不要写规则）" },
+          name: { type: "string", description: "add 必填：**主事件名**（如「GitHub 令牌」——同一事件只存一条，换值用 update）" },
+          keywords: { type: "string", description: "触发关键词，逗号/顿号分隔（如「令牌,token,gh-token」）；always=true 时可省" },
+          content: { type: "string", description: "add 必填：**次**——要触发的约定/口径内容（一两句话说清；不写规则全文）" },
+          state: { type: "string", description: "事件当前值；给了它，命中时会提示「书签里是 X」，口述不一致先纠" },
+          stateAt: { type: "string", description: "state 的更新日期（YYYY-MM-DD，可省）" },
           priority: { type: "number", description: "0-100，默认 50；预算不够时高优先级先留" },
           always: { type: "boolean", description: "常驻（每轮都带）；只给全书级常识用，别滥用" },
           enabled: { type: "boolean", description: "update 用：true 恢复 / false 停用" },
@@ -9816,12 +10122,12 @@ ${selfText}
           const lb = loreLayer();
           const action = String(args?.action || "list");
           if (action === "add") {
-            const r = lb.add({ name: args?.name, keywords: args?.keywords, content: args?.content, priority: args?.priority, always: args?.always });
+            const r = lb.add({ name: args?.name, keywords: args?.keywords, content: args?.content, priority: args?.priority, state: args?.state, stateAt: args?.stateAt, always: args?.always });
             if (!r.ok) return `加不了：${r.error}`;
-            return `已加书签 ${r.row.id}「${r.row.name}」${r.row.always ? "（常驻）" : `（关键词：${r.row.keywords.join("、")}）`}，优先级 ${r.row.priority}。\n文件：${lb.files.lore}`;
+            return `已加书签 ${r.row.id}「${r.row.name}」${r.row.always ? "（常驻）" : `（关键词：${r.row.keywords.join("、")}）`}${r.row.state ? `，状态：${r.row.state}` : ""}，优先级 ${r.row.priority}。\n文件：${lb.files.lore}`;
           }
           if (action === "update") {
-            const r = lb.update({ id: args?.id, name: args?.name, keywords: args?.keywords, content: args?.content, priority: args?.priority, always: args?.always, enabled: args?.enabled });
+            const r = lb.update({ id: args?.id, name: args?.name, keywords: args?.keywords, content: args?.content, state: args?.state, stateAt: args?.stateAt, priority: args?.priority, always: args?.always, enabled: args?.enabled });
             if (!r.ok) return `改不了：${r.error}`;
             return `已更新「${r.row.name}」：${r.row.enabled === false ? "已停用" : "生效中"}${r.row.always ? "／常驻" : ""}。`;
           }
@@ -9835,7 +10141,8 @@ ${selfText}
             if (!txt.trim()) return "check 需要 text。";
             const picked = lb.pick(txt, loreDefaults);
             if (!picked.length) return `没有条目命中「${clip(txt, 20)}」。`;
-            return [`命中 ${picked.length} 条（会注入）：`, ...picked.map((h) => `- 「${h.r.name}」${clip(h.r.content, 60)}${h.matched.length ? `（命中：${h.matched.join("、")}）` : "（常驻）"}`)].join("\n");
+            const st = (r) => (r.state ? `｜状态：${r.state}${r.stateAt ? `（${r.stateAt}）` : ""}` : "");
+            return [`命中 ${picked.length} 条（会注入）：`, ...picked.map((h) => `- 「${h.r.name}」${clip(h.r.content, 60)}${st(h.r)}${h.matched.length ? `（命中：${h.matched.join("、")}）` : "（常驻）"}`)].join("\n");
           }
           const list = lb.list({ includeDisabled: args?.includeDisabled });
           if (!list.length) return "世界书是空的（用 action=add 加一条）。";
@@ -10114,131 +10421,6 @@ ${selfText}
         return "不认识的 action：" + action + "（list / add / fact / shelve / restore）";
       },
     });
-    // v0.44.0 工具开关：list / on / off 一个入口管到底（技能开关交给 dsh-skillswitch，不重复造）。
-    register({
-
-      name: "tools_switch",
-      description: "工具开关：list 看三态、on pkg=… 热装载长尾工具集、off pkg=… 说明需改 bundles 并重启（不做假关）。",
-      parameters: {
-        type: "object",
-        properties: {
-          action: { type: "string", description: "list（默认）/ on / off" },
-          pkg: { type: "string", description: "包名，如 dsh-novel-forge" },
-        },
-      },
-      output,
-      async execute(args) {
-        const CONFIGS = {
-          "dsh-novel-forge": { minChapterChars: 2000, maxChapterChars: 4000, contextBudgetChars: 6000, scanTopK: 8, repetitionWindow: 10, skipPresetDeploy: true },
-        };
-        const ALLOW = ["dsh-novel-forge", "dsh-video-storyboard", "dsh-bili-scroll", "dsh-mindmap", "dsh-image-gen", "dsh-skill-hub"];
-        const action = String(args?.action || "list").trim().toLowerCase();
-        const profile = path.join(os.homedir(), ".dsh", "profiles", "desktop");
-        const readBundles = () => {
-          try {
-            const p = JSON.parse(fs.readFileSync(path.join(profile, "package.json"), "utf8"));
-            return (p.dsh && p.dsh.profile && p.dsh.profile.bundles) || [];
-          } catch { return []; }
-        };
-        const installed = () => {
-          try {
-            return fs.readdirSync(path.join(profile, "node_modules")).filter((n) => n.startsWith("dsh-") || n.startsWith("@"));
-          } catch { return []; }
-        };
-
-        if (action === "list") {
-          const bundles = readBundles();
-          let man = {};
-          try { man = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".dsh", "tools-manifest.json"), "utf8")); } catch {}
-          const inst = installed();
-          const off = Array.isArray(man.off) ? man.off : [];
-          const hot = ALLOW.filter((p) => inst.includes(p) && !bundles.includes(p));
-          const out = [];
-          out.push(`【工具开关】bundles ${bundles.length} 项` + (man.primary ? `｜三线取向：${man.primary}` : ""));
-          out.push("");
-          out.push(`已装载（启动即生效，${bundles.length}）：`);
-          out.push("  " + bundles.join(", "));
-          if (off.length) {
-            out.push("");
-            out.push(`未启用（${off.length}，各一句话）：`);
-            for (const o of off) out.push("  · " + o);
-          }
-          out.push("");
-          out.push(`可按需热装载（${hot.length}）：`);
-          if (hot.length) for (const p of hot) out.push("  → tools_switch action=on pkg=" + p);
-          else out.push("  (无；白名单外的包要先加进 ALLOW)");
-          out.push("");
-          out.push("要真关掉 → 从当前 profile 的 package.json（dsh.profile.bundles）里删掉那个包名，然后重启（运行中没有 unregister API）");
-          return out.join("\n");
-        }
-
-        if (action === "off") {
-          const pkg = String(args?.pkg || "").trim();
-          if (!pkg) return "给个包名：tools_switch action=off pkg=…";
-          return [
-            `运行中关不掉「${pkg}」——宿主没有 unregister API，工具一旦注册就活到进程结束。`,
-            "要关请改 bundles 再重启：",
-            `  从 dsh.profile.bundles 数组里删掉「${pkg}」，存盘后重启`,
-            "（反方向 on 同理；改完必须重启才生效）",
-          ].join("\n");
-        }
-
-        if (action === "on") {
-          const pkg = String(args?.pkg || "").trim();
-          if (pkg === "memory-tail") {
-            const n = flushQueuedTools();
-            return n ? `已展开记忆长尾工具 ${n} 个（下一轮可调用）` : "长尾工具已经全部展开过了";
-          }
-          if (!ALLOW.includes(pkg)) return `不在白名单：${pkg || "(空)"}；可热装的：${ALLOW.join(" / ")} / memory-tail`;
-          try {
-            const base = path.join(os.homedir(), ".dsh", "profiles", "desktop", "node_modules", pkg);
-            const man = JSON.parse(fs.readFileSync(path.join(base, "package.json"), "utf8"));
-            const ex = man.exports && man.exports["."];
-            const rel = (typeof ex === "string" && ex) || (ex && (ex.import || ex.default)) || man.main || "index.js";
-            const file = path.join(base, String(rel).replace(/^\.\//, ""));
-            const { pathToFileURL } = await import("node:url");
-            const mod = await import(pathToFileURL(file).href);
-            const loaded = [];
-            const real = toolCtx;
-            const proxied = new Proxy(real, {
-              get(target, prop) {
-                if (prop === "tools") {
-                  const t = target.tools || {};
-                  return { ...t, register: (def) => { if (def && def.name) loaded.push(def.name); return t.register(def); } };
-                }
-                const v = target[prop];
-                return typeof v === "function" ? v.bind(target) : v;
-              },
-            });
-            const applyFn = mod.apply || (mod.default && (mod.default.apply || mod.default));
-            if (typeof applyFn !== "function") return `装载失败：${pkg} 没有可调用的 apply()`;
-            const cfg = CONFIGS[pkg] || {};
-            const attempts = [];
-            const paths = [];
-            if (typeof toolCtx.plugin === "function") {
-              paths.push(["ctx.plugin(mod)", () => toolCtx.plugin(mod, cfg)]);
-              paths.push(["ctx.plugin(apply)", () => toolCtx.plugin(applyFn, cfg)]);
-            } else {
-              attempts.push("ctx.plugin 不存在");
-            }
-            paths.push(["apply(proxy)", () => applyFn(proxied, cfg)]);
-            let via = "";
-            for (const [label, run] of paths) {
-              loaded.length = 0;
-              try { await run(); attempts.push(label + " ✓ " + loaded.length + " 工具"); via = label; break; }
-              catch (err) { attempts.push(label + " ✗ " + (err?.message || err)); }
-            }
-            if (!via) return "装载失败：" + attempts.join(" ｜ ");
-            return `已装载 ${pkg}（via ${via}）：${loaded.length || "?"} 个工具可用`;
-          } catch (err) {
-            return `装载失败：${err?.message || err}`;
-          }
-        }
-
-        return `不认识的 action：${action}（只认 list / on / off）`;
-      },
-    });
-
 
     register({
 
@@ -10338,22 +10520,22 @@ ${selfText}
 
       name: "memory_control",
       description:
-        "控制记忆开关。action=enable/disable/status；action=summary 开关自动摘要（enabled=true/false，不传则切换）；action=summarize 立即给当前会话里未摘要的回合跑一次自动摘要，结果写进日记层（kind=auto-summary，只在检索时出现，不进每轮注入）；action=inject 用来切换记忆注入频率：mode=every-step（每步都注入，默认）或 first-step（只在会话第一次注入一次，之后要用 memory_search 自己查，省上下文）。action=recall 用来在对话里自己调“眼熟/顺手取回”的行为：不传参数=看当前设置与可用预设；传 enabled/minStrong/maxLines/showWeak/profile 则改设置——改完下一轮生效，不需要重启（跟随当前话题调，不想回忆就 enabled=false 暂关）。scope=session 只影响当前会话，global 影响所有会话。",
+        "控制记忆开关。enable/disable/status；summary 开关自动摘要；summarize 立刻给本会话未摘要回合跑一次（写进日记层，只在检索时出现）；inject 切注入频率：every-step 每步注入（默认）/ first-step 只首次注入（省上下文，之后自己 memory_search）；recall 调「顺手取回」：不传参数看设置，传 enabled/minStrong/maxLines/showWeak/profile 改设置，下一轮生效不用重启。scope=session 只影响当前会话，global 影响全部。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["enable", "disable", "status", "inject", "summary", "summarize", "recall"], description: "操作" },
           scope: { type: "string", enum: ["session", "global"], description: "范围，默认 session" },
-          enabled: { type: "boolean", description: "action=summary 时生效：true 开启自动摘要，false 关闭，不传则切换" },
+          enabled: { type: "boolean", description: "summary 用：true 开 / false 关 / 不传切换" },
           mode: {
             type: "string",
             enum: ["every-step", "first-step"],
-            description: "action=inject 时生效：every-step 每步注入；first-step 只在会话首次注入一次",
+            description: "inject 用：every-step 每步 / first-step 只首次",
           },
-          minStrong: { type: "number", description: "action=recall 时生效：同时命中几个词算“强命中”（1–3，默认 2；1 更积极，3 更保守）" },
-          maxLines: { type: "number", description: "action=recall 时生效：正文最多摆几条（1–6，默认 3）" },
-          showWeak: { type: "boolean", description: "action=recall 时生效：是否在末尾报“另有 N 条只擦到一点”" },
-          profile: { type: "string", description: "action=recall 时生效：切到某套预设（config 里 recall.profiles 的名字；空串=用默认值）" },
+          minStrong: { type: "number", description: "recall：命中几个词算强命中（1–3，默认 2）" },
+          maxLines: { type: "number", description: "recall：正文最多几条（1–6，默认 3）" },
+          showWeak: { type: "boolean", description: "recall：末尾是否报「另有 N 条只擦到一点」" },
+          profile: { type: "string", description: "recall：预设名（空串=默认）" },
         },
         required: ["action"],
       },
@@ -10502,17 +10684,17 @@ ${selfText}
 
       name: "memory_backup",
       description:
-        "立刻把记忆备份到 F 盘（深层、阵列、行为记忆、图片/音频资产、配置与运行态、原始会话）。若开着 config.backup.work（默认关，设置面板「工作文件」），会把手动备份那个目录整个复制成备份目录下的 work-<时间>/——那是给网页导出的工作内容准备的冷库位，不进记忆库、不参与检索、**不进每日快照轮转**（自己保留 keepArchives 份，默认 10；上限默认 20GB，GB 级也放得下）；传 work:true 表示这一次强制带上。自动备份永远不带它。自动备份一天最多一次、只保留 30 天；手动调用不受频率限制，也不会被清理策略拦。自动备份的频率/保留天数/是否含行为记忆，可在 Web UI「设置 → 记忆备份」面板里点选，等价于改 config.json 的 backup 段。mode=cloud 时改为生成**加密云包**（AES-256-GCM）写进指定文件夹（默认百度网盘同步目录 F:\\BaiduSyncdisk\\dsh-memory-cloud），网盘客户端一开就自动上传；云备份的密码不落盘，只读参数 password 或环境变量 DSH_MEMORY_BACKUP_PASS。【使用规则】密码绝不写进配置、脚本、文档或记忆；恢复时先解到独立目录、核对 sha256，确认后再人工覆盖记忆库（不要直接解到原位）。",
+        "立刻备份记忆（深层/阵列/行为/资产/配置/原始会话）。config.backup.work 开着时（默认关，设置面板「工作文件」）手动备份会额外带上 work-<时间>/（不进记忆库、不参与检索、不进每日轮转，保留 keepArchives 份）；work:true 这一次强制带。自动备份一天最多一次、保留 30 天，手动不受限。mode=cloud 生成 AES-256-GCM 加密云包（默认 F:\\BaiduSyncdisk\\dsh-memory-cloud）。【红线】密码不写进配置/脚本/文档/记忆，只走参数或 DSH_MEMORY_BACKUP_PASS；恢复先解到独立目录、核对 sha256 再人工覆盖，不要直接解到原位。",
       parameters: {
         type: "object",
         properties: {
           mode: { type: "string", enum: ["local", "cloud"], description: "local=本机快照（默认）；cloud=加密云包" },
-          password: { type: "string", description: "cloud 用：加密密码（会出现在调用记录里，更安全的做法是设 DSH_MEMORY_BACKUP_PASS 环境变量）" },
+          password: { type: "string", description: "cloud 密���；更安全的是设 DSH_MEMORY_BACKUP_PASS" },
           dir: { type: "string", description: "cloud 用：输出目录（默认百度网盘同步目录；也可指定别的文件夹）" },
           sessions: { type: "boolean", description: "cloud 用：是否含会话原文（默认不含，含了包大很多且涉隐私）" },
           assets: { type: "boolean", description: "cloud 用：是否含图片/音频资产（默认含）" },
           keepPacks: { type: "number", description: "cloud 用：目录里保留几个包（默认 6，旧的自动删）" },
-          work: { type: "boolean", description: "local 用：这一次把工作文件也带上（config.backup.work 开着才有目录可取；不用改配置）" },
+          work: { type: "boolean", description: "local：这一次把工作文件也带上" },
         },
       },
       output,
@@ -10739,7 +10921,7 @@ ${selfText}
     ctx.tools.register({
       name: "memory_source",
       description:
-        "出处（provenance）：记下「谁说的、在哪看到的」，也用于给图片/音频资产登记来源。action=add 登记一条出处：asset（资产文件名或 sha256 前缀，memory_image list 可看）或 hash（记忆条目 hash）二选一，配 author / id / url / platform / date / title / quote（verbatim=原文照抄，paraphrase=自己的转述）/ note；action=list 按时间列出（可筛 platform/asset/author/quote，limit 默认 20）；action=find 按关键词查（作者/BV号/URL/标题/资产名）；action=stats 看出处概况与「没出处的资产」。找不到出处就留空，不编造；检索结果里会自动显示出处，视频来源标 ▶。",
+        "出处（provenance）：记「谁说的、在哪看到的」，也给图片/音频资产登记来源。add：asset（资产名或 sha256 前缀，memory_image list 可看）或 hash 二选一，配 author/id/url/platform/date/title/quote/note；list 按时间列（可筛 platform/asset/author/quote）；find 按关键词查；stats 看出处概况与「没出处的资产」。找不到就留空，不编造；检索结果会自动显示出处，视频标 ▶。",
       parameters: {
         type: "object",
         properties: {
@@ -10749,12 +10931,12 @@ ${selfText}
           author: { type: "string", description: "谁说的/谁做的（UP 主、公众号、作者名）" },
           id: { type: "string", description: "平台上的 ID（如 BV1jNpo61E39）" },
           url: { type: "string", description: "原文链接" },
-          platform: { type: "string", description: "平台（bilibili / youtube / wechat / 网页…，不给按 id/url 自动猜）" },
+          platform: { type: "string", description: "平台；不给就按 id/url 猜" },
           date: { type: "string", description: "素材/文章的日期（YYYY-MM-DD）" },
           title: { type: "string", description: "标题" },
           quote: { type: "string", enum: ["verbatim", "paraphrase"], description: "verbatim=原文照抄；paraphrase=我自己的转述" },
           note: { type: "string", description: "备注（上下文、看到的场景等）" },
-          type: { type: "string", enum: ["image", "video", "audio", "text", "page"], description: "出处类型，挂资产时默认按资产类型" },
+          type: { type: "string", enum: ["image", "video", "audio", "text", "page"], description: "出处类型；挂资产时默认同资产" },
           query: { type: "string", description: "action=find 的关键词" },
           limit: { type: "number", description: "list/find 最多显示几条，默认 20" },
         },

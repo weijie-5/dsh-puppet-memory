@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { decodeSessionFile, dialogueOf, frameOffsets } from "../session-decode.js";
 let n = 0; const t = (name, fn) => { fn(); n += 1; console.log("  ✓ " + name); };
-const dir = "C:/Users/Administrator/.dsh/sessions";
+const dir = path.join(os.homedir(), ".dsh", "sessions");
 const ws = fs.existsSync(dir) ? fs.readdirSync(dir).map((x) => dir + "/" + x).find((p) => { try { return fs.statSync(p).isDirectory() && fs.readdirSync(p).length } catch { return false } }) : "";
 const sid = ws ? fs.readdirSync(ws).find((s) => fs.existsSync(ws + "/" + s + "/session.v4.jsonl.zstd")) : "";
 const file = sid ? ws + "/" + sid + "/session.v4.jsonl.zstd" : "";

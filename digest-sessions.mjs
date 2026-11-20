@@ -1,14 +1,15 @@
 // digest-sessions.mjs — 把最大的 N 个会话筛成候选，写进记忆候选池（零模型）
 // 用法：node digest-sessions.mjs [N=3] [--dry]
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { decodeSessionFile, dialogueOf } from "./session-decode.js";
 import { pickCandidates } from "./session-digest.js";
 import { appendCandidates, mechanismCutoff } from "./session-pool.js";
 
-const MEM = process.env.DSH_MEMORY_DIR || path.join(process.env.USERPROFILE || "C:/Users/Administrator", ".dsh", "memory");
+const MEM = process.env.DSH_MEMORY_DIR || path.join(os.homedir(), ".dsh", "memory");
 const POOL = path.join(MEM, "deep", "session-candidates.jsonl");
-const SESS = path.join(process.env.USERPROFILE || "C:/Users/Administrator", ".dsh", "sessions");
+const SESS = path.join(os.homedir(), ".dsh", "sessions");
 const dry = process.argv.includes("--dry");
 const topN = Math.max(1, Number(process.argv.find((a) => /^\d+$/.test(a)) || 3));
 
